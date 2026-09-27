@@ -14,6 +14,7 @@
 #include "base/tools/bswap_64.h"
 
 #include <chrono>
+#include <future>
 #include <cstdlib>
 #include <ctime>
 #include <inttypes.h>

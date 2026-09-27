@@ -36,9 +36,10 @@ static int gen_leaf(char which, uint32_t seed, int leaf, int m, int n, int k, ui
   for (int t = len; t < 1024; t++) out[t] = 0;
   return len;
 }
-static std::vector<std::vector<CV>> build_layers(char which, uint32_t seed, int numLeaves, int m, int n, int k, const uint8_t* key) {
+static std::vector<std::vector<CV>> build_layers(char which, uint32_t seed, int numLeaves, int m, int n, int k, const uint8_t* key, const uint8_t* cached = nullptr) {
   std::vector<CV> l0(numLeaves); uint8_t chunk[1024];
-  for (int i = 0; i < numLeaves; i++) { int len = gen_leaf(which, seed, i, m, n, k, chunk); pearlhash_b3::chunk_cv(chunk, (uint32_t)len, (uint64_t)i, key, l0[i].data()); }
+  if (cached) std::memcpy(l0.data(), cached, (size_t)numLeaves * 32);
+  else for (int i = 0; i < numLeaves; i++) { int len = gen_leaf(which, seed, i, m, n, k, chunk); pearlhash_b3::chunk_cv(chunk, (uint32_t)len, (uint64_t)i, key, l0[i].data()); }
   std::vector<std::vector<CV>> layers; layers.push_back(std::move(l0));
   while (layers.back().size() > 2) {
     auto& prev = layers.back(); std::vector<CV> next;
@@ -54,10 +55,13 @@ static void put_u64le(std::vector<uint8_t>& v, uint64_t n) { for (int i = 0; i <
 static void put_bytes(std::vector<uint8_t>& v, const uint8_t* p, int n) { v.insert(v.end(), p, p + n); }
 // Append a serialized MatrixMerkleProof for the 16 contiguous `rows` of matrix `which` (cols wide).
 static void ser_matrix_proof(std::vector<uint8_t>& out, char which, uint32_t seed, int m, int n, int k,
-                             const uint8_t* key, int cols, const std::vector<int>& rows) {
+                             const uint8_t* key, int cols, const std::vector<int>& rows, const uint8_t* cached = nullptr) {
   const int numLeaves = ((which == 'A' ? m : n) * k) / 1024;
-  auto layers = build_layers(which, seed, numLeaves, m, n, k, key);
-  uint8_t root[32]; { std::vector<CV> tmp = layers[0]; pearlhash_b3::merge_root((uint8_t*)tmp.data(), numLeaves, key, root); }
+  auto layers = build_layers(which, seed, numLeaves, m, n, k, key, cached);
+  uint8_t root[32];
+  if (std::getenv("MOM_PEARLHASH_REUSE_ROOT") && numLeaves > 1 && (numLeaves & (numLeaves-1)) == 0)
+    pearlhash_b3::parent_cv(layers.back()[0].data(), layers.back()[1].data(), key, true, root);
+  else { std::vector<CV> tmp = layers[0]; pearlhash_b3::merge_root((uint8_t*)tmp.data(), numLeaves, key, root); }
   std::set<int> leafset;
   for (int row : rows) { int first = (int)((long)row * cols / 1024), last = (int)(((long)(row + 1) * cols - 1) / 1024); for (int i = first; i <= last; i++) leafset.insert(i); }
   std::vector<int> leaves(leafset.begin(), leafset.end());
@@ -91,12 +95,12 @@ static std::string base64(const std::vector<uint8_t>& d) {
   return o;
 }
 // Full PlainProof (base64) for a winning tile, from the seed + job key (no noised matrices needed).
-static std::string build_plain_proof(uint32_t seed, int m, int n, int k, int rank, const uint8_t* key, int row, int col) {
+static std::string build_plain_proof(uint32_t seed, int m, int n, int k, int rank, const uint8_t* key, int row, int col, const uint8_t* cached = nullptr) {
   std::vector<int> aRows, btRows; for (int r = 0; r < 16; r++) { aRows.push_back(row + r); btRows.push_back(col + r); }
   std::vector<uint8_t> buf;
   put_u64le(buf, (uint64_t)m); put_u64le(buf, (uint64_t)n); put_u64le(buf, (uint64_t)k); put_u64le(buf, (uint64_t)rank);
-  ser_matrix_proof(buf, 'A', seed, m, n, k, key, k, aRows);
-  ser_matrix_proof(buf, 'B', seed, m, n, k, key, k, btRows);
+  ser_matrix_proof(buf, 'A', seed, m, n, k, key, k, aRows, cached);
+  ser_matrix_proof(buf, 'B', seed, m, n, k, key, k, btRows, cached ? cached + (size_t)m*k/1024*32 : nullptr);
   buf.push_back(0x00);   // moe: Option::None
   return base64(buf);
 }
@@ -207,7 +211,7 @@ PearlHashState& pearlhash_state(const std::string& dev_str) {
 }
 thread_local std::string g_pearlhash_proof;   // last built proof, fetched right after pearlhash() returns 1
 // Winning tile captured by pearlhash() on a find; consumed by pearlhash_proof() to build the proof lazily.
-thread_local struct PearlHashFound { uint32_t seed; int row, col, m, n, k, rank; uint8_t key[32]; bool valid; } g_pf{};
+thread_local PearlHashProofState g_pf{};
 } // namespace
 
 void pearlhash_cleanup_states() noexcept {
@@ -343,22 +347,34 @@ int pearlhash(
   if (!b.result->found) return 0;
   *pseed = b.result->seed;
   if (is_test) return 1;                                             // test: core only needs "ok", no proof
-  // Capture the winning tile; DEFER the heavy host PlainProof rebuild (regenerate A/Bt + the BLAKE3
-  // Merkle tree, ~tens of ms at m=n=16384) to pearlhash_proof(), which core calls ONCE per pool job_id.
-  // Building it here on every find would starve the DPAS search: at a low pool difficulty a tile is
-  // found on most attempts, yet the pool credits only one share per job. Deferring keeps the search
-  // running flat out (~6x faster live).
+  g_pf.leaf_cvs.reset();
+  const size_t leavesA = (size_t)m*k/1024, leavesB = (size_t)n*k/1024;
+  if (std::getenv("MOM_PEARLHASH_GPU_LEAVES") && intel_sycl_gpu &&
+      leavesA > 1 && leavesB > 1 && !(leavesA & (leavesA-1)) && !(leavesB & (leavesB-1))) {
+    const auto copy_start = std::chrono::steady_clock::now();
+    auto snapshot = std::make_shared<std::vector<uint8_t>>((leavesA+leavesB)*32);
+    q.memcpy(snapshot->data(), b.CVA, leavesA*32);
+    q.memcpy(snapshot->data()+leavesA*32, b.CVB, leavesB*32);
+    q.wait_and_throw();
+    g_pf.leaf_cvs = std::move(snapshot);
+    std::fprintf(stderr, "PROOF leaf_copy_ms=%.3f\n",
+      std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-copy_start).count());
+  }
   g_pf.seed = b.result->seed; g_pf.row = (int)b.result->row; g_pf.col = (int)b.result->col;
   g_pf.m = m; g_pf.n = n; g_pf.k = k; g_pf.rank = rank; std::memcpy(g_pf.key, st.key, 32); g_pf.valid = true;
   return 1;
 }
-// Builds the PlainProof for the last winning tile captured by pearlhash() (lazy: called once per job_id
-// by core, off the search hot path). Returns "" if no tile has been found yet.
-const char* pearlhash_proof() {
-  if (g_pf.valid)
-    g_pearlhash_proof = build_plain_proof(g_pf.seed, g_pf.m, g_pf.n, g_pf.k, g_pf.rank, g_pf.key, g_pf.row, g_pf.col);
+void pearlhash_capture_proof(PearlHashProofState* state) { *state = g_pf; }
+
+const char* pearlhash_build_proof(const PearlHashProofState* state) {
+  g_pearlhash_proof = state->valid
+    ? build_plain_proof(state->seed, state->m, state->n, state->k, state->rank,
+                        state->key, state->row, state->col, state->leaf_cvs ? state->leaf_cvs->data() : nullptr)
+    : std::string{};
   return g_pearlhash_proof.c_str();
 }
+
+const char* pearlhash_proof() { return pearlhash_build_proof(&g_pf); }
 // GEMM MACs per attempt = m*n*k, mirroring pearlhash()'s shape selection. This is the work unit
 // the pearlhash hashrate is reported in, so the core's display matches the "TH/s" GEMM benchmark.
 uint64_t pearlhash_attempt_hashes(unsigned intensity, unsigned n, unsigned k) {

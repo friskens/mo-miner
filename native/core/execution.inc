@@ -33,6 +33,13 @@ static void loop_stats_report(LoopStats& ls, const uint64_t now) {
 void Core::Execute() {
   debug_startup("Core::Execute entered");
   const bool loop_stats = std::getenv("MOM_LOOP_STATS") != nullptr;
+  const bool async_proof = std::getenv("MOM_PEARLHASH_ASYNC_PROOF") != nullptr;
+  std::future<MessageValues> pending_proof;
+  auto finish_proof = [&]() {
+    try { send_msg("result", pending_proof.get()); }
+    catch (const std::exception& e) { send_error(std::string("Proof construction failed: ") + e.what()); }
+    catch (...) { send_error("Proof construction failed"); }
+  };
   LoopStats ls;
   bool runtime_initialized = false;
   auto init_runtime = [&]() {
@@ -75,6 +82,9 @@ void Core::Execute() {
       else if (t_loop_start - ls.window_start > 10*1000*1000) loop_stats_report(ls, t_loop_start);
     }
 
+    if (pending_proof.valid() &&
+        pending_proof.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+      finish_proof();
     std::deque<Message> messages;
     fromNode.readAll(messages);
     for (const auto& message : messages) {
@@ -83,7 +93,13 @@ void Core::Execute() {
         if (message.name == "job" || message.name == "bench" || message.name == "test")
           init_runtime();
         if (loop_stats && (message.name == "job" || message.name == "bench")) ++ls.jobs;
-        if (!process_message(message.name, message.values)) return;
+        if (!process_message(message.name, message.values)) {
+          if (pending_proof.valid()) {
+            pending_proof.wait();
+            fprintf(stderr, "PROOF pending result discarded on worker shutdown\n");
+          }
+          return;
+        }
       } catch(const std::string& err) {
         send_error(std::string("Message processing exception: ") + err);
       }
@@ -406,11 +422,26 @@ void Core::Execute() {
         if (dev_sols == 1 && m_target) {
           MessageValues values;
           values["nonce"]       = nonce_to_hex(dev_nonce, 8);
-          values["plain_proof"] = pearlhash_proof();
           values["pool_id"]     = m_pool_id;
           values["worker_id"]   = m_worker_id;
           values["job_id"]      = m_job_id;
-          send_msg("result", values);
+          PearlHashProofState state{};
+          pearlhash_capture_proof(&state);
+          auto build = [state, values]() mutable {
+            const auto start = std::chrono::steady_clock::now();
+            values["plain_proof"] = pearlhash_build_proof(&state);
+            if (values["plain_proof"].empty()) throw std::runtime_error("Empty PearlHash proof");
+            if (std::getenv("MOM_PEARLHASH_PROOF_TIMING"))
+              fprintf(stderr, "PROOF seed=%u build_ms=%.3f\n", state.seed,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-start).count());
+            return values;
+          };
+          if (async_proof) {
+            if (pending_proof.valid()) finish_proof();
+            pending_proof = std::async(std::launch::async, std::move(build));
+          } else {
+            send_msg("result", build());
+          }
         }
         m_nonce64 += m_nonce_step;   // advance to the next seed (the blob is not touched)
         if (m_target && nonce_overflowed(prev_nonce, m_nonce64, m_nicehash_mask)) {

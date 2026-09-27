@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
+#include <vector>
 #include <set>
 #include <string>
 
@@ -129,6 +131,15 @@ MOM_SYCL_API int pearlhash(
   unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str,
   const std::string& backend, unsigned n, unsigned k, unsigned rank, unsigned cert_version
 );
+struct PearlHashProofState {
+  std::shared_ptr<const std::vector<uint8_t>> leaf_cvs;
+  uint32_t seed;
+  int row, col, m, n, k, rank;
+  uint8_t key[32];
+  bool valid;
+};
+MOM_SYCL_API void pearlhash_capture_proof(PearlHashProofState* state);
+MOM_SYCL_API const char* pearlhash_build_proof(const PearlHashProofState* state);
 MOM_SYCL_API const char* pearlhash_proof();
 // GEMM MACs per pearlhash attempt (m*n*k) -- the work unit the pearlhash "TH/s" hashrate is quoted in, so
 // the core counts this rather than the seed/intensity batch. Mirrors pearlhash()'s shape selection.
