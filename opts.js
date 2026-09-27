@@ -63,6 +63,7 @@ module.exports.opt_help = {
       is_keepalive:       [ true, "sends keepalive messages to the pool to avoid disconnect" ],
       use_subscribe:      [ true, "PearlHash pools: use mining.subscribe+authorize handshake; set false for pearlpool.cloud's login dialect and the MoneroOcean donate pool" ],
       worker:             [ "mom", "PearlHash subscribe-dialect worker name (mining.authorize)" ],
+      pearlhash_rank_penalty: [ false, "Apply the rank-128 normalized share target on pools enforcing the rank penalty" ],
       pearlhash_target_format: [ "base", "PearlHash subscribe target: base (apply jackpot scaling) or jackpot (already the final threshold)" ],
       login:              [ undefined, "pool login data" ],
       pass:               [ "", "pool password" ],
@@ -469,3 +470,4 @@ function setInternalObject(opt, key, key_help) {
   for (const item of templateItems(opt, key, key_help))
   {applyInternalTemplateValues(item, key_help._template);}
 }
+
