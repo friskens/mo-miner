@@ -99,7 +99,7 @@ the GPUs on adjacent rows; the last column names the comparison source.
 |                         | 5060 Ti | 3.39 KH/s (88%)     | 3.48 KH/s (90%)     | XMR-Stak                       |
 |                         | 9060 XT | 3.17 KH/s (118%)    | 2.81 KH/s (107%)    | SRBMiner / BZMiner             |
 | `pearlhash` / PRL       | B580    | 86.75 TH/s (102%)   | 86.89 TH/s (102%*)  | BZMiner (Linux)                |
-|                         | A770    | 89.07 TH/s (105%*)  | -                   | best peer*                     |
+|                         | A770    | 89.07 TH/s (105%*)  | 89.00 TH/s (105%*)  | best peer*                     |
 |                         | 5060 Ti | 80.49 TH/s (88%)    | 80.34 TH/s (88%)    | BZMiner                        |
 |                         | 9060 XT | 42.88 TH/s (64%*)   | 43.92 TH/s (67%*)   | BZMiner*                       |
 | `hoohash` / HTN         | B580    | 3.03 MH/s (174%*)   | 2.99 MH/s (180%*)   | best peer*                     |
@@ -135,11 +135,16 @@ Rates are steady-state measurements from the listed local GPUs on Ubuntu 26.04 L
 24H2, one GPU per process. The RTX 5060 Ti and RX 9060 XT used 150 W and 145 W limits; the B580 was
 not power-limited. Actual speed varies with drivers, clocks, power limits, and pool workload.
 
-A770 measurements are Linux-only, with an observed 190 W cap. Starred miner names use measured
-averages where available; thermal throttling, short benchmarks or different pool workloads make
+A770 measurements are Linux-only, with an observed 190 W cap, except the community-reported Windows
+PearlHash result below. Starred miner names use measured averages where available; thermal
+throttling, short benchmarks or different pool workloads make
 these approximate comparisons. When a matched A770 reference is unavailable, `best peer*` uses a
 measured reference from another GPU. Some A770 rates use earlier MoM builds:
 FishHash, KarlsenHashV2, BeamHash3, Equihash192_7, Verthash, Walahash and Etchash.
+
+The A770 Windows PearlHash rate is reported by [@friskens in discussion #8](https://github.com/MoneroOcean/mo-miner/discussions/8),
+who also reports a 91.1 TH/s 15-minute average with undervolting. These are community results, not
+controlled same-system measurements; the percentage uses the B580 Linux reference.
 
 PearlHash Linux reference rates are 85.09 TH/s for B580, 91.82 TH/s for RTX 5060 Ti,
 and 67.09 TH/s for RX 9060 XT, using BZMiner 100.45. Windows references are 91.75 TH/s for
