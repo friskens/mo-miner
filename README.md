@@ -98,10 +98,10 @@ the GPUs on adjacent rows; the last column names the comparison source.
 |                         | A770    | 2.41 KH/s (106%*)   | -                   | SRBMiner*                      |
 |                         | 5060 Ti | 3.39 KH/s (88%)     | 3.48 KH/s (90%)     | XMR-Stak                       |
 |                         | 9060 XT | 3.17 KH/s (118%)    | 2.81 KH/s (107%)    | SRBMiner / BZMiner             |
-| `pearlhash` / PRL       | B580    | 86.75 TH/s (102%)   | 86.89 TH/s (102%*)  | BZMiner (Linux)                |
-|                         | A770    | 89.07 TH/s (105%*)  | 89.00 TH/s (105%*)  | best peer*                     |
-|                         | 5060 Ti | 80.49 TH/s (88%)    | 80.34 TH/s (88%)    | BZMiner                        |
-|                         | 9060 XT | 42.88 TH/s (64%*)   | 43.92 TH/s (67%*)   | BZMiner*                       |
+| `pearlhash` / PRL       | B580    | 86.48 TH/s (102%)   | 86.87 TH/s (102%)   | BZMiner                        |
+|                         | A770    | 88.75 TH/s (104%*)  | 89.00 TH/s (105%*)  | best peer*                     |
+|                         | 5060 Ti | 94.93 TH/s (106%)   | 84.76 TH/s (93%)    | BZMiner                        |
+|                         | 9060 XT | 69.09 TH/s (102%)   | 69.54 TH/s (102%)   | BZMiner                        |
 | `hoohash` / HTN         | B580    | 3.03 MH/s (174%*)   | 2.99 MH/s (180%*)   | best peer*                     |
 |                         | A770    | Unsupported         | -                   | No FP64                        |
 |                         | 5060 Ti | 1.44 MH/s (83%)     | 1.42 MH/s (81%*)    | hoo_gpu (Linux)                |
@@ -146,10 +146,10 @@ The A770 Windows PearlHash rate is reported by [@friskens in discussion #8](http
 who also reports a 91.1 TH/s 15-minute average with undervolting. These are community results, not
 controlled same-system measurements; the percentage uses the B580 Linux reference.
 
-PearlHash Linux reference rates are 85.09 TH/s for B580, 91.82 TH/s for RTX 5060 Ti,
-and 67.09 TH/s for RX 9060 XT, using BZMiner 100.45. Windows references are 91.75 TH/s for
-RTX 5060 Ti and 65.68 TH/s for RX 9060 XT. Each miner uses its verified tuned configuration;
-the RX 9060 XT configurations differ. A770 uses the B580 reference.
+PearlHash references use BZMiner 100.52: Linux rates are 85.00 TH/s for B580, 89.52 TH/s for
+RTX 5060 Ti and 68.00 TH/s for RX 9060 XT; Windows rates are 85.04, 90.84 and 68.07 TH/s,
+respectively. Both miners use rank 128 and their own tuned matrix dimensions; rates count the
+same consensus matrix work. A770 uses the B580 Linux reference.
 
 ## GPU memory requirements
 

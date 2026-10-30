@@ -346,6 +346,16 @@ Node.js are not required on the target machine, and application runtimes are bun
 drivers remain host prerequisites; the installer checks the host and provisions supported missing
 dependencies and NVIDIA source-JIT tools.
 
+On Linux, PearlHash and CN/GPU share the checksum-pinned NVRTC 13.3.33 runtime in
+`/opt/mom/nvrtc-13.3.33`; the existing CUDA header/tool SDK remains separate. Fresh setup does not
+install an older NVRTC alongside it, and existing application SDKs are preserved. The release
+archive includes the small installer helper, not the compiler libraries; installation downloads
+the qualified runtime automatically.
+
+The compact PearlHash path is capability-gated to SM120a hardware and NVRTC 13.3 or newer;
+other architectures and older toolchains retain the existing kernels. Replace the complete
+release directory when upgrading: native workers and the miner must share the same internal ABI.
+
 The source-built compiler stages are cached independently so normal two-core GitHub packaging jobs
 assemble the miner instead of rebuilding LLVM. Release CI unpacks each final archive, runs the
 native CPU suite, and requires one fast portable SYCL/OpenCL CPU vector for every GPU algorithm.
