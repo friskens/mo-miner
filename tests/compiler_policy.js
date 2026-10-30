@@ -1865,17 +1865,100 @@ test.describe("Compiler policy and GPU contracts", {concurrency: false}, () => {
         "ESIMD capability gating must precede matrix layout selection");
     });
 
+    test("PearlHash AMD preparation carries noise readiness through SYCL events", () => {
+      const matrix = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/matrix.inc"), "utf8");
+      const dispatch = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/dispatch.inc"), "utf8");
+      assert.match(matrix, /static PearlHashEventPair k_noise\(/);
+      assert.match(matrix, /compute_ab_amd_wmma\([\s\S]*const sycl::event& a_noise_ready,[\s\S]*const sycl::event& b_noise_ready\)/);
+      assert.match(matrix, /h\.depends_on\(a_noise_ready\);/);
+      assert.match(matrix, /h\.depends_on\(b_noise_ready\);/);
+      assert.match(dispatch, /noise_ready = k_noise\(/);
+      assert.match(dispatch, /compute_ab_amd_wmma\([\s\S]*noise_ready\.a,[\s\S]*noise_ready\.b\)/);
+      const hipBranch = dispatch.slice(dispatch.indexOf("#if defined(MOM_SYCL_HAS_HIP)"));
+      assert(!hipBranch.includes("q.wait_and_throw(); // both independent prep streams"),
+        "AMD preparation must not reintroduce a host wait before dependent queue submission");
+      assert.match(dispatch, /if \(split_hip_noise\)[\s\S]*sycl_wait_and_throw\(noise_ready\.a,[\s\S]*sycl_wait_and_throw\(noise_ready\.b,/,
+        "a failed native probe must rejoin split noise before the portable path reads it");
+    });
+
     test("PearlHash discovery emits complete measured profiles with a low-memory fallback", () => {
       const intensity = fs.readFileSync(path.join(__dirname, "../sycl/intensity.inc"), "utf8");
+      const powIntensity = fs.readFileSync(path.join(__dirname, "../sycl/pow-intensity.h"), "utf8");
       const params = fs.readFileSync(path.join(__dirname, "../sycl/algo_params.inc"), "utf8");
+      const hipApi = fs.readFileSync(path.join(__dirname, "../sycl/hiprtc-api.h"), "utf8");
+      const hipJit = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/hip_jit.inc"), "utf8");
       assert.ok(intensity.includes("global_mem_size>() >= 8 * GiB"));
       assert.ok(intensity.includes("pearlhash_profile_t{131072, 524288, 8192, 128}"));
       assert.ok(intensity.includes("pearlhash_profile_t{65536, 65536, 4096, 256}"));
       assert.match(intensity, /sycl_is_level_zero_gpu\(dev\) && !is_integrated_gpu\(dev\)/);
       assert.match(intensity, /pearlhash_intel_capability_profile\(\s*mom_intel_eu_simd_width\(dev\)/);
+      assert.match(intensity, /#if defined\(MOM_SYCL_ADAPTIVECPP\) && defined\(MOM_SYCL_HAS_HIP\)/);
+      assert.match(intensity, /pearlhash_amd_native_int8\(dev\)/);
+      assert.match(intensity, /pearlhash_amd_native_profile_for\(pow_device_profile\(dev\), true\)/);
+      assert.match(powIntensity,
+        /for \(const auto& profile : \{pearlhash_profile_t\{524288, 524288, 2048, 128\},\s+pearlhash_profile_t\{262144, 262144, 2048, 128\}\}\)\s+if \(pearlhash_required_memory_fits\(device, profile\)\)/,
+        "AMD native defaults must try the measured shapes in throughput order with exact capacity checks");
+      assert.match(intensity, /if \(!mom_is_hip\(dev\)\)\s+return false/,
+        "optional AMD discovery must keep non-HIP devices on the portable profile");
+      assert.match(intensity, /static bool pearlhash_amd_native_int8\(const sycl::device& dev\) \{[\s\S]*#if defined\(MOM_SYCL_ADAPTIVECPP\) && defined\(MOM_SYCL_HAS_HIP\)\s+try \{\s+if \(!mom_is_hip\(dev\)\)/,
+        "backend probing must be inside the optional-probe failure boundary");
+      assert.match(intensity, /try \{[\s\S]*hip_gfx12_int8_wmma_supported\(queue\)[\s\S]*catch \(\.\.\.\) \{\s+return false;/,
+        "optional AMD discovery must fail closed when HIP interop/property probing fails");
+      assert.match(intensity,
+        /if \(pearlhash_amd_native_int8\(dev\)\) \{\s+try \{\s+profile = pearlhash_amd_native_profile_for\(pow_device_profile\(dev\), true\);\s+\} catch \(\.\.\.\) \{/,
+        "capacity metadata failures must retain the ordinary profile");
+      assert.doesNotMatch(intensity, /vendor\.find\("amd"\)/,
+        "AMD default selection must not be keyed by vendor text");
+      assert.match(hipApi, /inline bool hip_gfx12_int8_wmma_supported\(/);
+      assert.match(hipApi, /hip_queue_identity\(queue, device, stream\)/);
+      assert.match(hipApi, /mom::amd::has_gfx12_int8_wmma\(properties\.gcnArchName\)/);
+      assert.match(hipJit, /if \(!mom_is_hip\(q\.get_device\(\)\)\)/);
+      assert.match(hipJit, /return mom::hip_gfx12_int8_wmma_supported\(q, reason\)/);
+      assert.doesNotMatch(intensity, /vendor_id/, "AMD profile must not use PCI/vendor IDs");
+      assert.match(intensity, /const bool nvidia = vendor\.find\("nvidia"\)/);
+      assert.match(intensity, /vendor\.find\("intel"\)/);
+      assert.match(intensity, /MOM_PEARLHASH_INTENSITY/);
+      assert.match(intensity, /profile\.m = round_down_to_multiple/);
+      assert.match(intensity, /profile\.n = profile\.m/);
       assert.ok(params.includes("\"*[m=\" + std::to_string(profile.m)"));
       for (const field of ["n", "k", "rank"]) {
         assert.ok(params.includes(`";${field}=" + std::to_string(profile.${field})`));
+      }
+    });
+
+    test("PearlHash AMD discovery keeps the ordinary profile when capacity metadata throws", {
+      skip: process.platform === "win32",
+    }, () => {
+      const intensity = fs.readFileSync(path.join(__dirname, "../sycl/intensity.inc"), "utf8");
+      const capacityProbe = extractCppBlock(intensity, "  if (pearlhash_amd_native_int8(dev)) {");
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-capacity-probe-"));
+      const source = path.join(fixture, "capacity_probe.cpp");
+      const executable = path.join(fixture, "capacity_probe");
+      fs.writeFileSync(source, [
+        "#include <cstdio>",
+        "struct Device {};",
+        "struct Profile { unsigned m; };",
+        "static bool pearlhash_amd_native_int8(const Device&) { return true; }",
+        "static Profile pow_device_profile(const Device&) { throw 7; }",
+        "static Profile pearlhash_amd_native_profile_for(const Profile&, bool) { return {524288}; }",
+        "int main() {",
+        "  Device dev;",
+        "  Profile profile{131072};",
+        capacityProbe,
+        "  if (profile.m != 131072) return 1;",
+        "  std::puts(\"PASS capacity fallback\");",
+        "}",
+        "",
+      ].join("\n"));
+      try {
+        const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+          "-pedantic", source, "-o", executable], {encoding: "utf8"});
+        assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+        const result = spawnSync(executable, [], {encoding: "utf8"});
+        assert.equal(result.status, 0, result.error?.message || result.stderr);
+        assert.equal(result.stdout, "PASS capacity fallback\n");
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
       }
     });
 
@@ -2017,13 +2100,17 @@ test.describe("Compiler policy and GPU contracts", {concurrency: false}, () => {
     });
 
     test("AMD matrix paths share a conservative selected-device instruction gate", () => {
-      for (const file of ["octopus/amd_wmma.inc", "walahash/amd_wmma.inc", "pearlhash/hip_jit.inc"]) {
+      for (const file of ["octopus/amd_wmma.inc", "walahash/amd_wmma.inc"]) {
         const source = fs.readFileSync(path.join(__dirname, "../sycl", file), "utf8");
         assert.match(source, /hipGetDeviceProperties\(/);
         assert.match(source, /mom::amd::has_gfx12_int8_wmma\(/);
         assert.doesNotMatch(source, /strncmp\([^\n]*gcnArchName/);
         assert.match(source, /"--offload-arch=" \+ arch/);
       }
+      const pearl = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/hip_jit.inc"), "utf8");
+      assert.match(pearl, /mom::hip_gfx12_int8_wmma_supported\(q, reason\)/);
+      assert.doesNotMatch(pearl, /strncmp\([^\n]*gcnArchName/);
+      assert.match(pearl, /"--offload-arch=" \+ arch/);
       const octopus = readSyclSource(path.join(__dirname, "../sycl/octopus/octopus.cpp"));
       assert.match(octopus, /subgroup_32 = mom_is_cuda\(state\.device\) \|\|\s+std::find\(subgroup_sizes/);
       assert.match(octopus, /!std::getenv\("MOM_OCTOPUS_BATCHED"\) && subgroup_32/);
@@ -2272,6 +2359,76 @@ test.describe("Compiler policy and GPU contracts", {concurrency: false}, () => {
         /fence<esimd::memory_kind::global, esimd::fence_flush_op::clean,\s+esimd::fence_scope::group>/);
     });
 
+    test("Pearl CUDA checkpoint ternary logic preserves every accumulator word", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const kernel = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/cuda_kernel.inc"), "utf8");
+      const helper = extractCppBlock(kernel, "__device__ __forceinline__ uint32_t pearlhash_xor3(");
+      const assembly = /asm volatile\("lop3\.b32 %0, %1, %2, %3, (0x[0-9a-f]+);"\s*: "=r"\(out\) : "r"\(a\), "r"\(b\), "r"\(c\)\);/;
+      const match = helper.match(assembly);
+      assert.ok(match, "the actual PTX operand mapping must match the emulated truth table");
+      const start = kernel.indexOf("        const uint32_t v0 = uint32_t(accumulator(lo));");
+      const end = kernel.indexOf("        // Every lane contributes", start);
+      assert.ok(start >= 0 && end > start);
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-cuda-checkpoint-xor-"));
+      try {
+        const source = path.join(fixture, "reduction.cpp"), executable = path.join(fixture, "probe");
+        fs.copyFileSync(path.join(__dirname, "native/pearlhash_cuda_reduction.cpp"), source);
+        fs.writeFileSync(path.join(fixture, "reduction.inc"), kernel.slice(start, end));
+        for (const negative of [false, true]) {
+          const truth = Number(match[1]) ^ Number(negative);
+          fs.writeFileSync(path.join(fixture, "xor3.inc"),
+            helper.replace(assembly, `out = fixture_lop3(a, b, c, ${truth}u);`));
+          const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
+            source, "-o", executable], {encoding: "utf8"});
+          assert.equal(compiled.status, 0, compiled.stderr);
+          const result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+          assert.equal(result.error, undefined);
+          assert.equal(result.status, Number(negative), result.stdout + result.stderr);
+          assert.match(negative ? result.stderr : result.stdout, negative ? /differs from the canonical reduction/ : /^PASS actual-source CUDA checkpoint/);
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("Hoo and Nexa transfer only the result and extranonce bytes they consume", () => {
+      const hoo = fs.readFileSync(path.join(__dirname, "../sycl/hoohash/hoohash.cpp"), "utf8");
+      assert.equal(hoo.split("memcpy(&result.offset, state.result, sizeof(result.offset))").length, 3);
+      assert(!hoo.includes("memcpy(&result, state.result, sizeof(result))"));
+      // Keep the test kernel's hash store: otherwise its expensive filter can be optimized away.
+      const kernel = extractCppBlock(hoo, "static sycl::event test_hash(");
+      assert.match(kernel, /filter_hash\(/);
+      assert.match(kernel, /result->hash\[i\] = out\[i\];/);
+      const nexa = fs.readFileSync(path.join(__dirname, "../sycl/nexapow/nexapow.cpp"), "utf8");
+      assert.match(nexa, /if \(extra_bytes\)\s+state\.queue\.memcpy\(state\.extranonce, input \+ 32, extra_bytes\);/);
+      assert(!nexa.includes("memcpy(state.extranonce, input + 32, 8)"));
+    });
+
+    test("Xelis cleanup attempts every allocation and preserves replacement ownership", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const state = fs.readFileSync(path.join(__dirname, "../sycl/xelishashv3/state.inc"), "utf8");
+      const begin = state.indexOf("  // Detach before");
+      const end = state.indexOf("\n};", begin);
+      assert.ok(begin > 0 && end > begin);
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-xelis-ownership-"));
+      try {
+        const source = path.join(fixture, "fixture.cpp");
+        const executable = path.join(fixture, "fixture");
+        fs.copyFileSync(path.join(__dirname, "native/xelishashv3_ownership.cpp"), source);
+        fs.writeFileSync(path.join(fixture, "ownership.inc"), state.slice(begin, end));
+        const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+          "-pedantic", source, "-o", executable], {encoding: "utf8"});
+        assert.equal(compiled.status, 0, compiled.stderr);
+        const result = spawnSync(executable, [], {encoding: "utf8"});
+        assert.equal(result.status, 0, result.stderr);
+        assert.equal(result.stdout, "PASS XelisHashV3 ownership cleanup and growth\n");
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
     test("Zel and Beam reserve solver diagnostics for tests or explicit profiling", {
       skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
     }, () => {
@@ -2329,6 +2486,16 @@ test.describe("Compiler policy and GPU contracts", {concurrency: false}, () => {
       } finally {
         fs.rmSync(fixture, {recursive: true, force: true});
       }
+    });
+
+    test("BeamHash3 profiling readback uses the shared throwing completion boundary", () => {
+      const source = fs.readFileSync(path.join(__dirname, "../sycl/beamhash3/beamhash3.cpp"), "utf8");
+      const start = source.indexOf("std::vector<uint32_t> ns(NBUCKETS);");
+      const end = source.indexOf("for (uint32_t v : ns)", start);
+      assert.ok(start >= 0 && end > start);
+      assert.match(source.slice(start, end),
+        /sycl_wait_and_throw\(q\.memcpy\(ns\.data\(\),[\s\S]*sizeof\(uint32_t\)\), state\.device\);/);
+      assert.doesNotMatch(source.slice(start, end), /\.wait\(\)/);
     });
 
     test("ZelHash discovery leaves allocation-sensitive slots to the workload process", () => {
@@ -3005,6 +3172,70 @@ test.describe("Compiler policy and GPU contracts", {concurrency: false}, () => {
         {k: 8192, rank: 128});
       assert.deepEqual(gpuTuning.parseDeviceEntry("gpu1*[k=16640;rank=256]", "pearlhash").tuning,
         {k: 16640, rank: 256});
+    });
+
+    test("PearlHash Merkle reduction stays canonical, bounded, and leaf-preserving", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "..");
+      const matrix = fs.readFileSync(path.join(root, "sycl/pearlhash/matrix.inc"), "utf8");
+      const reduction = extractCppBlock(matrix, "static size_t reduce_tree(");
+
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearlhash-merkle-"));
+      const source = path.join(fixture, "pearlhash_merkle.cpp");
+      const reductionFile = path.join(fixture, "reduce_tree.inc");
+      const executable = path.join(fixture, "pearlhash_merkle");
+      const sourceFile = path.join(root, "tests/native/pearlhash_merkle.cpp");
+      const baseArgs = ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", "-pedantic",
+        "-I", root, source, "-o", executable];
+      const sanitizerArgs = process.platform === "win32" ? [] : [
+        "-fsanitize=address,undefined", "-fsanitize-address-use-after-scope", "-fno-omit-frame-pointer",
+        ...(process.platform === "linux" ? ["-fno-pie", "-no-pie"] : []),
+      ];
+      const compile = () => {
+        let result = spawnSync("c++", [...baseArgs, ...sanitizerArgs], {encoding: "utf8"});
+        // Some host C++ installations expose no sanitizer runtime; retain regular C++17 coverage.
+        if (result.status !== 0 && sanitizerArgs.length) {
+          result = spawnSync("c++", baseArgs, {encoding: "utf8"});
+        }
+        assert.equal(result.error, undefined, result.error?.message);
+        assert.equal(result.signal, null, result.stderr);
+        assert.equal(result.status, 0, result.stderr);
+      };
+      /** @param {string} body @param {string} needle @param {string} replacement */
+      const mutateOnce = (body, needle, replacement) => {
+        assert.equal(body.split(needle).length, 2, "mutation anchor must be unique");
+        return body.replace(needle, replacement);
+      };
+      const variants = [
+        {name: "candidate", body: reduction, pass: true},
+        {name: "ROOT on an odd intermediate level", body: mutateOnce(reduction,
+          "const bool is_root = cnt == 2;", "const bool is_root = cnt == 2 || cnt == 3;"), pass: false},
+        {name: "wrong odd carry bytes", body: mutateOnce(reduction,
+          "out[byte] = left[byte];", "out[byte] = static_cast<uint8_t>(left[byte] ^ 1u);"), pass: false},
+        {name: "ping-pong writes over cached leaves", body: mutateOnce(reduction,
+          "const size_t first = static_cast<size_t>(nc);", "const size_t first = 0;"), pass: false},
+      ];
+      try {
+        fs.copyFileSync(sourceFile, source);
+        for (const variant of variants) {
+          fs.writeFileSync(reductionFile, variant.body);
+          compile();
+          const result = spawnSync(executable, [], {encoding: "utf8", timeout: 10000});
+          assert.equal(result.error, undefined, result.error?.message);
+          assert.equal(result.signal, null, result.stderr);
+          if (variant.pass) {
+            assert.equal(result.status, 0, result.stdout + result.stderr);
+            assert.equal(result.stdout,
+              "PARALLEL_TREE_SOURCE 1128 canonical-root/leaf-cache/bounds/ROOT/layout/reuse cases PASS\n");
+          } else {
+            assert.notEqual(result.status, 0,
+              variant.name + " unexpectedly passed\n" + result.stdout + result.stderr);
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
     });
 
     test("GPU backend and compiler policy boundaries reject prefixes and coercive objects", () => {
@@ -4091,6 +4322,34 @@ int main() {
   });
 
   test.describe("Source-JIT fallback boundaries, parameter probes, and GPU/Pearl tuning", {concurrency: false}, () => {
+    test("All native algorithms share the managed NVRTC compiler with legacy fallbacks", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, async (t) => {
+      const header = fs.readFileSync(path.join(__dirname, "../sycl/cuda-api.h"), "utf8");
+      const start = header.indexOf("class NvrtcApi {");
+      const end = header.indexOf("// Own only the temporary compiler program", start);
+      assert.ok(start >= 0 && end > start);
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-nvrtc-shared-"));
+      try {
+        fs.writeFileSync(path.join(fixture, "loader.inc"), header.slice(start, end));
+        const source = path.join(__dirname, "native/nvrtc_loader.cpp");
+        const executable = path.join(fixture, "loader");
+        const build = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+          "-pedantic", "-I" + fixture, source, "-o", executable], {encoding: "utf8", timeout: 30000});
+        assert.equal(build.status, 0, build.error?.message || build.stderr);
+        for (const mode of ["managed", "unversioned", "alias13", "legacy", "none",
+          "missing-version", "missing-cubin", "missing-required", "missing-builtins"]) {
+          await t.test(mode, () => {
+            const run = spawnSync(executable, [mode], {encoding: "utf8", timeout: 10000});
+            assert.equal(run.status, 0, run.error?.message || run.stderr);
+            assert.equal(run.stdout, "SHARED_NVRTC_LOADER_PASS mode=" + mode + " GPU_calls=0\n");
+          });
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
     test("NVRTC temporary programs release once across source-JIT failures", {
       skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
     }, async (t) => {
@@ -4144,7 +4403,8 @@ int main() {
           {id: 15, name: "cache hit loads without creating a program"},
           {id: 16, name: "non-CUDA device creates no program"},
         ];
-        for (const [variant, name] of ["CN PTX", "Pearl CUBIN", "Pearl forward PTX"].entries()) {
+        for (const [variant, name] of ["CN native CUBIN", "Pearl CUBIN", "Pearl forward PTX",
+          "CN forward PTX", "CN PTX-only API"].entries()) {
           await t.test(name, {concurrency: false}, async (variantTest) => {
             for (const {id, name: description} of cases) {
               await variantTest.test(name + ": " + description, () => {
@@ -4157,6 +4417,36 @@ int main() {
 
           });
         }
+        for (const [id, description] of [
+          [21, "architecture-count query failure"],
+          [22, "empty architecture list"],
+          [23, "unbounded architecture list"],
+          [24, "architecture query failure"],
+          [25, "empty compiler output"],
+          [26, "oversized compiler output"],
+        ]) {
+          await t.test(`CN native CUBIN: ${description}`, () => {
+            const result = spawnSync(executable, ["1", String(id)], {encoding: "utf8"});
+            assert.equal(result.status, 0, result.error?.message || result.stderr);
+            assert.equal(result.signal, null);
+            assert.equal(result.stdout, "PASS actual-source NVRTC lifetime\n");
+          });
+        }
+        for (const [id, description] of [
+          [17, "null A allocation falls back before NVRTC"],
+          [18, "null B allocation falls back before NVRTC"],
+          [19, "misaligned A allocation falls back before NVRTC"],
+          [20, "misaligned B allocation falls back before NVRTC"],
+        ]) {
+          for (const variant of [2, 3]) {
+            await t.test(`${variant === 2 ? "Pearl CUBIN" : "Pearl forward PTX"}: ${description}`, () => {
+              const result = spawnSync(executable, [String(variant), String(id)], {encoding: "utf8"});
+              assert.equal(result.status, 0, result.error?.message || result.stderr);
+              assert.equal(result.signal, null);
+              assert.equal(result.stdout, "PASS actual-source NVRTC lifetime\n");
+            });
+          }
+        }
         if (owner) {
           for (const {id, name, output} of [
             {id: 13, name: "empty owner/reset is a no-op", output: "PASS empty owner\n"},
@@ -4168,6 +4458,51 @@ int main() {
               assert.equal(result.signal, null);
               assert.equal(result.stdout, output);
             });
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("Nexa monolithic result clear stays ordered without pre-search wait", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "../sycl");
+      const host = fs.readFileSync(path.join(root, "nexapow/nexapow.cpp"), "utf8");
+      const library = fs.readFileSync(path.join(root, "lib-internal.h"), "utf8");
+      /** @param {string} source @param {string} start @param {string} end */
+      const section = (source, start, end) => {
+        const begin = source.indexOf(start), stop = source.indexOf(end, begin + start.length);
+        assert.ok(begin >= 0 && stop > begin, start);
+        return source.slice(begin, stop);
+      };
+      const entry = section(host, "  state.init_portable();", "  return 1;\n}") + "  return 1;\n";
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-nexapow-submission-"));
+      try {
+        const source = path.join(fixture, "submission.cpp"), executable = path.join(fixture, "probe");
+        fs.copyFileSync(path.join(__dirname, "native/nexapow_submission.cpp"), source);
+        fs.writeFileSync(path.join(fixture, "result.inc"), section(host, "struct Result {", "static constexpr uint8_t"));
+        fs.writeFileSync(path.join(fixture, "cleanup.inc"),
+          section(library, "inline void sycl_log_cleanup_exception(", "sycl::device get_dev("));
+        for (const fixed of [false, true]) {
+          const clear = "state.queue.memset(state.result, 0, sizeof(Result));";
+          assert.ok(entry.includes(clear));
+          fs.writeFileSync(path.join(fixture, "entry.inc"), fixed ? entry :
+            entry.replace(clear, "sycl_wait_and_throw(state.queue.memset(state.result, 0, sizeof(Result)), state.device);"));
+          const compiled = spawnSync("c++", ["-std=c++17", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic",
+            "-fsanitize=address", "-fsanitize-address-use-after-scope", "-fno-omit-frame-pointer",
+            ...(process.platform === "linux" ? ["-fno-pie", "-no-pie"] : []), source, "-o", executable],
+          {encoding: "utf8"});
+          assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+          const result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+          assert.equal(result.error, undefined);
+          assert.equal(result.signal, null);
+          assert.equal(result.status, fixed ? 0 : 1, result.stdout + result.stderr);
+          if (fixed) {
+            assert.equal(result.stdout, "PASS actual-source NexaPoW monolithic submission order\n");
+          } else {
+            assert.match(result.stderr, /NexaPoW command order changed/);
           }
         }
       } finally {
@@ -4193,6 +4528,7 @@ int main() {
       const source = path.join(fixture, "cuda.cpp");
       const executable = path.join(fixture, "cuda");
       fs.writeFileSync(source, `
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -4216,6 +4552,7 @@ constexpr int CUDA_SUCCESS = 0;
 constexpr int CUDA_ERROR_NOT_READY = 600;
 constexpr int NVRTC_SUCCESS = 0;
 constexpr int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 1;
+constexpr int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 2;
 constexpr int CU_EVENT_DEFAULT = 0;
 static int fault;
 static bool driver_available = true;
@@ -4227,6 +4564,7 @@ struct Counts {
   unsigned launch = 0;
   unsigned record = 0;
   unsigned query = 0;
+  unsigned synchronize = 0;
   unsigned create_program = 0;
   unsigned destroy_program = 0;
   unsigned initial_wait = 0;
@@ -4249,8 +4587,8 @@ struct CudaDriverApi {
   }
   bool basic_available() const { return driver_available; }
   int (*init)(unsigned) = +[](unsigned) { return 0; };
-  int (*device_attribute)(int*, int, int) = +[](int* out, int, int) {
-    *out = 9;
+  int (*device_attribute)(int*, int, int) = +[](int* out, int attribute, int) {
+    *out = attribute == CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR ? 9 : 0;
     return 0;
   };
   int (*retain_primary)(void**, int) = +[](void** out, int) {
@@ -4259,6 +4597,10 @@ struct CudaDriverApi {
     return 0;
   };
   int (*set_current)(void*) = +[](void*) { return 0; };
+  int (*synchronize)() = +[]() {
+    ++counts.synchronize;
+    return 999; // Secondary cleanup errors must not replace the original native failure.
+  };
   int (*module_load)(void**, const void*) = +[](void** out, const void*) {
     *out = &handles[1];
     return 0;
@@ -4308,6 +4650,11 @@ struct NvrtcApi {
     return api;
   }
   bool ptx_available() const { return true; }
+  bool cubin_available() const { return false; }
+  int (*get_num_supported_archs)(int*) = nullptr;
+  int (*get_supported_archs)(int*) = nullptr;
+  int (*get_cubin_size)(void*, size_t*) = nullptr;
+  int (*get_cubin)(void*, char*) = nullptr;
   int (*create_program)(void**, const char*, const char*, int, const char* const*, const char* const*) =
       +[](void** out, const char*, const char*, int, const char* const*, const char* const*) {
         ++counts.create_program;
@@ -4334,6 +4681,7 @@ ${owner}
 void cuda_check(const CudaDriverApi&, int status, const char* message) {
   if (status != CUDA_SUCCESS) throw std::string(message);
 }
+${extractCppBlock(header, "inline void cuda_check_submitted(")}
 std::string rtc_error(const NvrtcApi&, int, void*, const char* message) { return message; }
 namespace jit_cache {
 uint64_t hash(const std::string&) { return 1; }
@@ -4373,6 +4721,8 @@ int main(int argc, char** argv) {
     if (argc != 2) throw std::runtime_error("case argument");
     const int id = std::atoi(argv[1]);
 #if defined(MOM_SYCL_HAS_CUDA)
+    if (id == 9)
+      mom::CudaDriverApi::instance().synchronize = nullptr;
     if (id == 6) {
       fault = 5;
       {
@@ -4414,16 +4764,20 @@ int main(int argc, char** argv) {
               id == 4 ? "cuLaunchKernel(cn/gpu)" :
               id == 5 ? "cuEventQuery(cn/gpu)" : "cuEventRecord(cn/gpu)";
           check(caught == expected, "fault identity changed");
-        } else if (id == 1) {
+          check(counts.synchronize == (id == 3 ? 0u : 1u),
+                "native failure did not retire work before returning to SYCL");
+        } else if (id == 1 || id == 9) {
           check(!native && counts.generic == 1 && caught.empty() && counts.launch == 0 &&
                 state.native_notice, "startup unavailability did not fall back");
+          check(counts.create_program == 0, "unsafe native backend compiled before fallback");
         } else {
           check(id == 2 && native && counts.generic == 0 && caught.empty() &&
-                counts.launch == 1 && counts.record == 1 && counts.query == 2,
+                counts.launch == 1 && counts.record == 1 && counts.query == 2 &&
+                counts.synchronize == 0,
                 "native success changed");
         }
       }
-      check(counts.release == (id == 1 ? 0u : 1u) &&
+      check(counts.release == (id == 1 || id == 9 ? 0u : 1u) &&
             counts.unload == counts.release && counts.destroy == counts.release,
             "owner cleanup did not release resources once");
       check(counts.create_program == counts.destroy_program, "NVRTC program leaked");
@@ -4455,6 +4809,7 @@ int main(int argc, char** argv) {
         "nullable startup reason cleans partial resources once",
         "post-launch event-record fault propagates without generic retry",
         "unsupported worker retains nullable-reason fallback",
+        "missing native retirement API falls back before submission",
       ];
       try {
         for (const enabled of [true, false]) {
@@ -4463,7 +4818,7 @@ int main(int argc, char** argv) {
           const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
             "-pedantic", ...flags, "-I", directory, source, "-o", target], {encoding: "utf8"});
           assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
-          const indexes = enabled ? cases.slice(0, 7).map((_name, index) => index) : [7];
+          const indexes = enabled ? [0, 1, 2, 3, 4, 5, 6, 8] : [7];
           for (const index of indexes) {
             const name = cases[index];
             assert.ok(name);
@@ -4488,12 +4843,18 @@ int main(int argc, char** argv) {
       const ownerStart = header.indexOf("class HiprtcProgram {");
       const owner = ownerStart < 0 ? "" :
         header.slice(ownerStart, header.lastIndexOf("} // namespace mom")).trim();
+      const capabilityStart = header.indexOf("inline bool hip_gfx12_int8_wmma_supported(");
+      const capabilityEnd = header.indexOf("// HIPRTC is optional", capabilityStart);
       const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-hiprtc-program-"));
       const source = path.join(fixture, "hiprtc_program.cpp");
       const executable = path.join(fixture, "hiprtc_program");
       try {
         fs.copyFileSync(path.join(__dirname, "native/hiprtc_program.cpp"), source);
         fs.writeFileSync(path.join(fixture, "owner.inc"), owner ? "namespace mom {\n" + owner + "\n}\n" : "");
+        assert.ok(capabilityStart > 0 && capabilityEnd > capabilityStart,
+          "the HIP capability helper must remain source-extractable");
+        fs.writeFileSync(path.join(fixture, "capability.inc"),
+          "namespace mom {\n" + header.slice(capabilityStart, capabilityEnd) + "}\n");
         for (const algorithm of ["octopus", "walahash"]) {
           const caller = fs.readFileSync(path.join(root, algorithm, "amd_wmma.inc"), "utf8");
           const start = caller.indexOf("struct ");
@@ -4551,6 +4912,17 @@ int main(int argc, char** argv) {
             });
           }
         }
+        for (const [id, output] of [
+          [15, "PASS capability property failure\n"],
+          [16, "PASS capability interop propagation\n"],
+        ]) {
+          await t.test("optional AMD capability probe failure " + id, () => {
+            const result = spawnSync(executable, ["1", String(id)], {encoding: "utf8"});
+            assert.equal(result.status, 0, result.error?.message || result.stderr);
+            assert.equal(result.signal, null);
+            assert.equal(result.stdout, output);
+          });
+        }
       } finally {
         fs.rmSync(fixture, {recursive: true, force: true});
       }
@@ -4561,9 +4933,9 @@ int main(int argc, char** argv) {
     }, async (t) => {
       const root = path.join(__dirname, "../sycl");
       const header = fs.readFileSync(path.join(root, "hiprtc-api.h"), "utf8");
-      const identityFunction = header.indexOf(" hip_queue_identity(");
-      const identityStart = header.lastIndexOf("inline ", identityFunction);
-      const identityEnd = header.indexOf("// HIPRTC is optional", identityStart);
+      const identityStart = header.indexOf("inline void hip_queue_identity(");
+      const identityEnd = header.indexOf("inline void hip_queue_device(", identityStart);
+      const aliasEnd = header.indexOf("// Query the actual HIP architecture", identityEnd);
       const octopus = fs.readFileSync(path.join(root, "octopus/nvidia_tensor.inc"), "utf8");
       const classStart = octopus.indexOf("class OctopusSyclNativeSearch {");
       const contextStart = octopus.indexOf("struct NativeGemmContext {");
@@ -4571,7 +4943,8 @@ int main(int argc, char** argv) {
       const wmma = fs.readFileSync(path.join(root, "octopus/amd_wmma.inc"), "utf8");
       const wmmaStart = wmma.indexOf("  bool ensure(");
       const wmmaEnd = wmma.indexOf("    hipDeviceProp_t properties{}", wmmaStart);
-      assert.ok(identityStart > 0 && identityEnd > identityStart && classStart > contextEnd &&
+      assert.ok(identityStart > 0 && identityEnd > identityStart && aliasEnd > identityEnd &&
+      classStart > contextEnd &&
       contextStart > 0 && contextEnd > contextStart && wmmaStart > 0 && wmmaEnd > wmmaStart);
       const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-hip-interop-"));
       const source = path.join(fixture, "hip_queue_identity.cpp");
@@ -4579,7 +4952,7 @@ int main(int argc, char** argv) {
       try {
         fs.copyFileSync(path.join(__dirname, "native/hip_queue_identity.cpp"), source);
         fs.writeFileSync(path.join(fixture, "identity.inc"),
-          "namespace mom {\n" + header.slice(identityStart, identityEnd) + "}\n");
+          "namespace mom {\n" + header.slice(identityStart, aliasEnd) + "}\n");
         fs.writeFileSync(path.join(fixture, "octopus.inc"), octopus.slice(classStart));
         fs.writeFileSync(path.join(fixture, "gemm-context.inc"), octopus.slice(contextStart, contextEnd + 3));
         fs.writeFileSync(path.join(fixture, "wmma-init.inc"), wmma.slice(wmmaStart, wmmaEnd));
@@ -4621,9 +4994,21 @@ int main(int argc, char** argv) {
         for (const [stage, name] of octopusFallbacks) {
           cases.push({target: 2, stage, kind: 0, name: "Octopus retains " + name + " behavior"});
         }
+        for (const target of [3, 4]) {
+          for (const kind of [0, 1, 2]) {
+            for (const [stage, operation] of octopusOperations.filter(([stage]) => stage < 10)) {
+              cases.push({target, stage, kind,
+                name: operation + " retires pipeline before retry" + (target === 4 ? " despite cleanup faults" : "")});
+            }
+          }
+        }
         await runGroupedCases(
           t, cases,
           ({target, stage, kind}) => {
+            if (target >= 3) {
+              return "Octopus live-owner retirement: " + ["std::exception", "std::string", "unknown"][kind] +
+                (target === 4 ? " with cleanup faults" : "");
+            }
             if (target < 2) {return target ? "Device alias" : "HIP identity";}
             if (stage === 0 || stage === 14) {return "Octopus HIP compatibility";}
             if (stage <= 10) {
@@ -5722,7 +6107,183 @@ int main(int argc, char** argv) {
   });
 
   test.describe("Submitted faults, upload ownership, and cache readiness", {concurrency: false}, () => {
-    test("PearlHash HIP shape admission bounds transcript word indexing", {
+    test("PearlHash compact inputs preserve legacy bytes and immutable cached proofs", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, async (t) => {
+      const root = path.join(__dirname, "../sycl/pearlhash");
+      const matrix = fs.readFileSync(path.join(root, "matrix.inc"), "utf8");
+      const host = fs.readFileSync(path.join(root, "pearlhash.cpp"), "utf8");
+      const proofHost = fs.readFileSync(path.join(root, "host.inc"), "utf8");
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-inputs-"));
+      const generator = extractCppBlock(matrix, "static inline int8_t gv(");
+      const assignment = "  b.seed_prefix_inputs = compact_mode && b.positive_inputs;\n";
+      assert.equal(host.split(assignment).length, 2);
+      try {
+        fs.writeFileSync(path.join(fixture, "bounds.inc"),
+          extractCppBlock(matrix, "static size_t checked_elements(") +
+          extractCppBlock(matrix, "static size_t checked_chunk_count("));
+        const run = (/** @type {string} */ body, /** @type {string} */ select,
+          /** @type {RegExp | undefined} */ failure = undefined,
+          /** @type {string} */ proofBody = proofHost) => {
+          fs.writeFileSync(path.join(fixture, "gv.inc"), body);
+          fs.writeFileSync(path.join(fixture, "select.inc"), select);
+          fs.writeFileSync(path.join(fixture, "host.inc"), proofBody);
+          const executable = path.join(fixture, "test");
+          const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-Wno-unused-function", "-I" + fixture, path.join(__dirname, "native/pearlhash_input_modes.cpp"),
+            "-o", executable], {encoding: "utf8", timeout: 30000});
+          assert.equal(compiled.status, 0, compiled.stderr);
+          const result = spawnSync(executable, [], {encoding: "utf8", timeout: 30000,
+            env: {...process.env, MOM_TEST_EXPORT_PROOFS: ""}});
+          assert.equal(result.error, undefined); assert.equal(result.signal, null);
+          assert.equal(result.status, failure ? 1 : 0, result.stdout + result.stderr);
+          if (failure) {assert.match(result.stderr, failure);} else {assert.match(result.stdout, /PEARL_INPUT_MODES_PASS/u);}
+        };
+        await t.test("actual generator and proof cache", () => run(generator, assignment));
+        const leaked = generator.replace("positive_inputs && seed_prefix_inputs", "positive_inputs && (seed_prefix_inputs || true)");
+        assert.notEqual(leaked, generator);
+        await t.test("prefix cannot replace legacy input streams", () =>
+          run(leaked, assignment, /legacy generator changed/u));
+        const unguarded = generator.replace("positive_inputs && seed_prefix_inputs", "positive_inputs || seed_prefix_inputs");
+        assert.notEqual(unguarded, generator);
+        await t.test("prefix cannot escape the positive-input gate", () =>
+          run(unguarded, assignment, /prefix escaped positive gate/u));
+        const stale = assignment.replace("compact_mode && b.positive_inputs", "compact_mode ? b.positive_inputs : b.seed_prefix_inputs");
+        assert.notEqual(stale, assignment);
+        await t.test("fallback must clear a stale prefix mode", () =>
+          run(generator, stale, /stale seed-prefix mode/u));
+        const bound = "(uint64_t(m) + uint64_t(n)) * uint64_t(k) <= (uint64_t{1} << 32)";
+        assert.equal(proofHost.split(bound).length, 2);
+        await t.test("constant leaf fill must retain wrapped raw indices", () =>
+          run(generator, assignment, /compact leaf bytes/u, proofHost.replace(bound, "true")));
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash positive inputs use exact source mappings and an admitted INT8 gate", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "..");
+      const matrix = fs.readFileSync(path.join(root, "sycl/pearlhash/matrix.inc"), "utf8");
+      const plainProof = fs.readFileSync(path.join(root, "tests/native/pearlhash_plain_proof.cpp"), "utf8");
+      const production = fs.readFileSync(path.join(root, "sycl/pearlhash/pearlhash.cpp"), "utf8");
+      const cudaKernel = fs.readFileSync(path.join(root, "sycl/pearlhash/cuda_kernel.inc"), "utf8");
+      const gv = extractCppBlock(matrix, "static inline int8_t gv(");
+      assert.equal(extractCppBlock(plainProof, "static inline int8_t gv("), gv,
+        "the host proof fixture must use the exact production mapping");
+      const gate = extractCppBlock(production, "static bool pearlhash_positive_inputs(");
+      assert.doesNotMatch(gate, /tested_shape|m %|n %|rank %|k \/ rank/u,
+        "route admission owns shape checks; the arithmetic gate must stay narrow");
+      assert.doesNotMatch(gate, /vendor_id|0x1002|0x10de/u,
+        "native route admission owns backend identity; SYCL vendor metadata is not a PCI gate");
+      assert.match(gate, /k > 0/);
+      assert.match(gate, /static_cast<uint64_t>\(k\)[\s\S]*max_positive_operand/u);
+      assert.match(production,
+        /PearlHashHipSearch::supports_shape\(m, n, k, rank\)/u,
+        "HIP route shape admission must remain in its actual supports_shape helper");
+      assert.match(production,
+        /PearlHashCudaSearch::supports_shape\(m, n, k, rank\)/u,
+        "CUDA JIT route shape admission must remain in its actual supports_shape helper");
+      assert.match(production, /cuda_sycl_search_supports_shape\(m, n\)/u,
+        "CUDA tensor route shape admission must remain in its actual route helper");
+      // The producer byte domain is a separate policy bit from the MMA opcode: native rank-256
+      // intentionally keeps S8 MMA while the bounded native-int8 producer may use [0,127].
+      assert.match(production,
+        /b\.positive_inputs = pearlhash_positive_inputs\(\s*q\.get_device\(\),\s*native_int8_route \|\| cuda_tensor_route,\s*k\s*\);/u,
+        "positive producer policy must remain route/bound based rather than an accidental rank gate");
+      assert.match(cudaKernel,
+        /#if PEARLHASH_RANK == 128[\s\S]*SM80_16x8x32_S32U8U8S32_TN[\s\S]*#else[\s\S]*SM80_16x8x32_S32S8S8S32_TN/u,
+        "rank-256 native CUDA must retain its S8 MMA opcode despite the producer policy");
+      const resetStart = production.indexOf("// Even a rejected next call");
+      const resetEnd = production.indexOf("if (!input", resetStart);
+      assert.ok(resetStart >= 0 && resetEnd > resetStart);
+      const reset = production.slice(resetStart, resetEnd);
+      assert.match(reset, /g_pf\.valid = false;[\s\S]*g_pf\.claim_ready = false;[\s\S]*g_pf\.leaves_a\.clear\(\)[\s\S]*g_pf\.leaves_b\.clear\(\)/u,
+        "a rejected attempt must clear the prior winning claim");
+      assert.match(production, /g_pf\.positive_inputs = b\.positive_inputs;/u,
+        "the winner must retain the mode used for its cached leaves");
+      assert.match(production, /g_pf\.positive_inputs\);/u,
+        "claim regeneration must use the captured mode");
+      const pairGuard = production.match(/if \(pair_dist8 && !b\.positive_inputs\)\s+throw std::string\("PearlHash CUDA pair requires positive inputs in \[0,127\]"\);/u)?.[0];
+      assert.ok(pairGuard, "unsigned CUDA MMA must reject incompatible producer bytes");
+      const attemptTry = production.indexOf("  try {", production.indexOf("PearlHashSearchBackend search_backend;"));
+      const guardPosition = production.indexOf(pairGuard, attemptTry);
+      assert.ok(guardPosition > attemptTry && guardPosition < production.indexOf("derive_key_pair_dist8(input", attemptTry),
+        "the domain guard must run inside attempt cleanup and before key/producer work");
+
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearlhash-positive-gate-"));
+      try {
+        const source = [
+          "#include <cstdint>",
+          "#include <cstdio>",
+          "#include <limits>",
+          "#include <string>",
+          "namespace sycl {",
+          "class device {",
+          " public:",
+          "  device(std::uint32_t metadata, bool gpu) : metadata_(metadata), gpu_(gpu) {}",
+          "  bool is_gpu() const { return gpu_; }",
+          " private:",
+          "  std::uint32_t metadata_;",
+          "  bool gpu_;",
+          "};",
+          "}",
+          gate,
+          "static bool rejects_pair(bool pair_dist8, bool positive) {",
+          "  struct { bool positive_inputs; } b{positive};",
+          "  try {", pairGuard, "  } catch (const std::string&) { return true; }",
+          "  return false;",
+          "}",
+          "struct Case { const char* name; std::uint32_t vendor; bool gpu; bool native; int k; bool expected; };",
+          "int main() {",
+          "  const Case cases[] = {",
+          "    {\"AMD AdaptiveCpp vendor metadata 0x1022\", 0x1022u, true, true, 2048, true},",
+          "    {\"AMD AdaptiveCpp vendor metadata decimal 1022\", 1022u, true, true, 2048, true},",
+          "    {\"NVIDIA native\", 0x10deu, true, true, 8192, true},",
+          "    {\"F16/portable native=false\", 0x10deu, true, false, 8192, false},",
+          "    {\"CPU\", 0x1002u, false, true, 2048, false},",
+          "    {\"Intel route not admitted\", 0x8086u, true, false, 2048, false},",
+          "    {\"unknown trusted native route\", 0x1u, true, true, 2048, true},",
+          "    {\"route not admitted\", 0x10deu, true, false, 2048, false},",
+          "    {\"zero K\", 0x10deu, true, true, 0, false},",
+          "    {\"aligned signed-bound control\", 0x10deu, true, true, 133120, true},",
+          "    {\"exact signed-bound edge\", 0x10deu, true, true, 133144, true},",
+          "    {\"exact signed-bound overflow\", 0x10deu, true, true, 133145, false},",
+          "    {\"aligned signed-bound overflow control\", 0x10deu, true, true, 133184, false},",
+          "    {\"negative K\", 0x10deu, true, true, -1, false},",
+          "  };",
+          "  for (const Case& c : cases) {",
+          "    const sycl::device device(c.vendor, c.gpu);",
+          "    if (pearlhash_positive_inputs(device, c.native, c.k) != c.expected) {",
+          "      std::fprintf(stderr, \"gate mismatch: %s\\n\", c.name);",
+          "      return 1;",
+          "    }",
+          "  }",
+          "  for (const bool pair : {false, true})",
+          "    for (const bool positive : {false, true})",
+          "      if (rejects_pair(pair, positive) != (pair && !positive)) return 1;",
+          "  std::puts(\"PASS actual-source PearlHash positive gate\");",
+          "}",
+        ].join("\n");
+        const sourceFile = path.join(fixture, "positive_gate.cpp");
+        const executable = path.join(fixture, "positive_gate");
+        fs.writeFileSync(sourceFile, source);
+        const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+          "-pedantic", sourceFile, "-o", executable], {encoding: "utf8"});
+        assert.equal(compiled.error, undefined, compiled.error?.message);
+        assert.equal(compiled.status, 0, compiled.stderr);
+        const result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+        assert.equal(result.error, undefined, result.error?.message);
+        assert.equal(result.signal, null, result.stderr);
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.equal(result.stdout, "PASS actual-source PearlHash positive gate\n");
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash HIP shape admission supports bounded row slices", {
       skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
     }, () => {
       const source = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/hip_jit.inc"), "utf8");
@@ -5737,7 +6298,843 @@ int main(int argc, char** argv) {
         assert.equal(compiled.status, 0, compiled.stderr);
         const result = spawnSync(executable, [], {encoding: "utf8"});
         assert.equal(result.status, 0, result.stderr);
-        assert.match(result.stdout, /within 32-bit word offsets/);
+        assert.match(result.stdout, /supports bounded row slices/);
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash CUDA cache swizzles cover each global CTA exactly once", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const source = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/cuda_kernel.inc"), "utf8");
+      const starts = [...source.matchAll(/^\x20{2}int block_m = int\(blockIdx\.x\);$/gmu)]
+        .map(({index}) => index);
+      assert.equal(starts.length, 2, "both staged and packed CUDA branches must retain swizzle");
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-cuda-swizzle-"));
+      try {
+        for (const [branch, start] of starts.entries()) {
+          const ctaEnd = source.indexOf("  auto cta_coord = make_coord(block_m, block_n, _);", start);
+          const warpEnd = source.indexOf("  const int warp = int(threadIdx.x) >> 5;", start);
+          const end = ctaEnd > start ? ctaEnd : warpEnd;
+          assert.ok(end > start, `swizzle branch ${branch} is incomplete`);
+          fs.writeFileSync(path.join(fixture, "swizzle.inc"), source.slice(start, end));
+          const executable = path.join(fixture, `swizzle-${branch}`);
+          const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-pedantic", "-I" + fixture, path.join(__dirname, "native/pearlhash_cuda_swizzle.cpp"),
+            "-o", executable], {encoding: "utf8"});
+          assert.equal(compiled.status, 0, compiled.stderr);
+          const result = spawnSync(executable, [], {encoding: "utf8"});
+          assert.equal(result.status, 0, result.stdout + result.stderr);
+          assert.match(result.stdout, /CUDA swizzle coordinate checks passed/u);
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash CUDA vector128 producers are CUTE-bijective past 4 GiB", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const matrix = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/matrix.inc"), "utf8");
+      const kernel = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/cuda_kernel.inc"), "utf8");
+      assert.match(kernel, /const uint64_t a_bytes = a_base \* packed_tile_bytes;/u);
+      assert.match(kernel, /const uint64_t packet_end = k32_count \* packed_tile_bytes;/u);
+      assert.match(kernel, /if \(even_bytes < packet_end\)/u);
+      assert.match(kernel, /odd_bytes \+= 2u \* packed_tile_bytes;/u);
+      const helper = extractCppBlock(matrix,
+        "template <bool IsA>\nstatic inline size_t nvidia_vector128_offset(");
+      assert.match(helper, /return \(\(row \/ 64U\)[\s\S]*depth & 3U\);/u);
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-cuda-offset-"));
+      const executable = path.join(fixture, "offset");
+      const source = path.join(__dirname, "native/pearlhash_cuda_offset.cpp");
+      const compile = () => spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+        "-pedantic", "-I" + fixture, source, "-o", executable], {encoding: "utf8"});
+      try {
+        fs.writeFileSync(path.join(fixture, "offset.inc"), helper);
+        let compiled = compile();
+        assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+        let result = spawnSync(executable, [], {encoding: "utf8", timeout: 10000});
+        assert.equal(result.error, undefined);
+        assert.equal(result.signal, null);
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.match(result.stdout, /SCATTER_GATHER is_a=1 values=2097152 PASS/u);
+        assert.match(result.stdout, /SCATTER_GATHER is_a=0 values=2097152 PASS/u);
+        assert.match(result.stdout, /BOUNDARIES is_a=1 .*2G=0x80000000 4G=0x100000000 PASS/u);
+        assert.match(result.stdout, /BOUNDARIES is_a=0 .*2G=0x80000000 4G=0x100000000 PASS/u);
+        assert.match(result.stdout, /CAST32_NEGATIVE_CONTROL rejected=PASS/u);
+        assert.match(result.stdout, /ROLLING_PREFETCH_SEQUENCE packets=256 B_end=0xffffffff PASS/u);
+        assert.match(result.stdout, /PRODUCER_OFFSET_TEST PASS/u);
+
+        const returnLine = "  return ((row / 64U) * static_cast<size_t>(k / 32) + depth / 32U) * 2048U +\n" +
+          "         (word / 4U) * 512U + lane * 16U + (word % 4U) * 4U + (depth & 3U);\n";
+        assert.equal(helper.split(returnLine).length, 2, "offset return anchor must be unique");
+        const truncated = helper.replace(returnLine,
+          returnLine.replace("  return ", "  return static_cast<uint32_t>(").replace(";\n", ");\n"));
+        fs.writeFileSync(path.join(fixture, "offset.inc"), truncated);
+        compiled = compile();
+        assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+        result = spawnSync(executable, [], {encoding: "utf8", timeout: 10000});
+        assert.equal(result.error, undefined);
+        assert.equal(result.signal, null);
+        assert.notEqual(result.status, 0, "32-bit offset mutation unexpectedly passed");
+        assert.match(result.stderr, /exact 4 GiB producer offset changed/u);
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash CUDA rank-128 store preserves the dense output ABI", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const kernel = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/cuda_kernel.inc"), "utf8");
+      const storeStart = kernel.indexOf("  const uint64_t dense_proof_index =");
+      const storeEnd = kernel.indexOf("\n}\n\n#endif", storeStart);
+      assert.ok(storeStart >= 0 && storeEnd > storeStart,
+        "the actual rank-128 dense store body must remain extractable");
+      const store = kernel.slice(storeStart, storeEnd);
+      assert.match(store, /dense_proof_index/u);
+      assert.match(store, /transcript_out\[/u);
+      assert.match(store, /for \(int word = 0; word < 8/u);
+
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-cuda-store-"));
+      const source = path.join(__dirname, "native/pearlhash_cuda_store.cpp");
+      const executable = path.join(fixture, "store");
+      /** @param {string} body @param {string} output */
+      const compile = (body, output) => {
+        fs.writeFileSync(path.join(fixture, "store.inc"), body);
+        const result = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+          "-pedantic", "-I" + fixture, source, "-o", output], {encoding: "utf8"});
+        assert.equal(result.error, undefined, result.error?.message);
+        assert.equal(result.status, 0, result.stderr);
+      };
+      try {
+        compile(store, executable);
+        let result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+        assert.equal(result.error, undefined, result.error?.message);
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.match(result.stdout,
+          /CUDA_STORE_FIXTURE PASS source=actual rank128 words=256 canaries=PASS warp_coords=PASS endpoint_B=0xffffffff/u);
+
+        result = spawnSync(executable, ["--duplicate"], {encoding: "utf8", timeout: 5000});
+        assert.equal(result.error, undefined, result.error?.message);
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.match(result.stdout, /CUDA_STORE_NEGATIVE duplicate_write=REJECTED/u);
+
+        // Mutate only the actual dense row coordinate. A valid source body must reject this
+        // permutation through the independent canonical map or bounded sink, regardless of
+        // whether the implementation obtains the paired word with a shuffle or writes it
+        // directly from each lane.
+        assert.equal(store.split("lane >> 3").length, 2,
+          "dense row coordinate must have one source anchor");
+        const wrongLane = store.replace("lane >> 3", "lane >> 2");
+        const wrongExecutable = path.join(fixture, "store-wrong-lane");
+        compile(wrongLane, wrongExecutable);
+        result = spawnSync(wrongExecutable, [], {encoding: "utf8", timeout: 5000});
+        assert.equal(result.error, undefined, result.error?.message);
+        assert.notEqual(result.status, 0, "wrong dense lane mutation unexpectedly passed");
+        assert.match(result.stderr, /CUDA_STORE_FIXTURE FAIL/u);
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash CUDA pair proofs preserve physical coordinates and captured mode", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "../sycl/pearlhash");
+      const kernel = fs.readFileSync(path.join(root, "cuda_kernel.inc"), "utf8");
+      const host = fs.readFileSync(path.join(root, "pearlhash.cpp"), "utf8");
+      const state = fs.readFileSync(path.join(root, "state.inc"), "utf8");
+      const search = fs.readFileSync(path.join(root, "sycl_search.inc"), "utf8");
+      const matrix = fs.readFileSync(path.join(root, "matrix.inc"), "utf8");
+      const mode = host.indexOf("const bool pair_dist8 = cuda_native_int8_route && rank == 128 && (k == 8192 || compact_mode);");
+      const admitted = host.indexOf("cuda_native_int8_route = st.cuda.ensure(");
+      const key = host.indexOf("derive_key_pair_dist8(input, k, rank, st.key);");
+      assert.ok(admitted >= 0 && mode > admitted && key > mode);
+      assert.match(host, /if \(st.have_header && st.header_pair_dist8 != pair_dist8\)\s+st.have_header = false;/u);
+      assert.match(host, /g_pf.pair_dist8 = pair_dist8;/u);
+      assert.match(host, /(?:else )?if \(g_pf.pair_dist8\)\s+g_pearlhash_proof = build_pair_plain_proof/u);
+      assert.match(state, /header_pair_dist8 = false;/u);
+      const release = extractCppBlock(state, "  void release() noexcept {");
+      const ensure = extractCppBlock(state, "  void ensure(");
+      assert.match(release, /fixed_b_valid = false;[\s\S]*have_header = false;[\s\S]*header_pair_dist8 = false;/u,
+        "state release must invalidate fixed-B and the keyed header/pattern");
+      assert.match(ensure, /if \(b\.Ap &&[\s\S]*cuda_jit_buffers == cuda_jit_\)\s+return;/u,
+        "same-shape/JIT state may be retained only when every layout selector matches");
+      assert.match(ensure, /release\(\);[\s\S]*fixed_b_valid = false;/u,
+        "shape or JIT-mode changes must release buffers and invalidate fixed-B");
+      assert.doesNotMatch(matrix, /pair_dist8/u, "ordinary GPU buffers must not acquire pair mode");
+      assert.match(search, /bool Pair = false/u);
+      assert.match(search, /if \(!is_cuda\)\s+throw std::string\("PearlHash pair-dist8 reference dispatch requires CUDA"\);/u);
+      const inverseStart = kernel.indexOf("  const uint32_t warp_tiles_n =");
+      const inverseEnd = kernel.indexOf("\n#else", inverseStart);
+      const storeStart = kernel.indexOf("  const uint64_t dense_proof_index =");
+      const storeEnd = kernel.indexOf(";\n", storeStart) + 2;
+      assert.ok(inverseStart > 0 && inverseEnd > inverseStart && storeStart > inverseEnd && storeEnd > storeStart);
+      const checkpointAnchorNeedle = "      const int transcript_word = (rank_chunk - 1) & 15;";
+      const checkpointAnchor = kernel.indexOf(checkpointAnchorNeedle);
+      assert.equal(kernel.split(checkpointAnchorNeedle).length, 2,
+        "rank-128 checkpoint anchor must be unique");
+      assert.ok(checkpointAnchor > 0, "rank-128 checkpoint anchor is required");
+      const candidateStartNeedle = "      uint32_t lane_part_even = 0;";
+      const candidateEndNeedle =
+        "      const uint32_t lane_part = lane_part_even ^ lane_part_odd;";
+      const controlStartNeedle = "      uint32_t lane_part = 0;";
+      const controlEndNeedle = "      // Every lane participates";
+      let checkpointKind;
+      let checkpointStart;
+      let checkpointEndNeedle;
+      if (kernel.indexOf(candidateStartNeedle, checkpointAnchor) >= 0) {
+        checkpointKind = "xor2-even-odd";
+        checkpointStart = kernel.indexOf(candidateStartNeedle, checkpointAnchor);
+        checkpointEndNeedle = candidateEndNeedle;
+      } else {
+        checkpointKind = "single-chain-control";
+        checkpointStart = kernel.indexOf(controlStartNeedle, checkpointAnchor);
+        checkpointEndNeedle = controlEndNeedle;
+      }
+      assert.ok(checkpointStart > checkpointAnchor,
+        "rank-128 recurrence must follow the exact transcript anchor");
+      const checkpointEnd = kernel.indexOf(checkpointEndNeedle, checkpointStart);
+      assert.ok(checkpointEnd > checkpointStart,
+        "rank-128 recurrence end anchor is required");
+      const checkpointBody = kernel.slice(checkpointStart, checkpointEnd + checkpointEndNeedle.length);
+      assert.equal(checkpointBody.split("accumulator(").length - 1, 8,
+        "rank-128 recurrence must retain eight textual accumulator loads in its 16-step loop");
+      if (checkpointKind === "xor2-even-odd") {
+        assert.match(checkpointBody, /const bool odd_tile = \(tile_index & 1\) != 0;/u);
+        assert.match(checkpointBody, /const uint32_t next = pearlhash_xor3/u);
+        assert.match(checkpointBody, /lane_part_even = next/u);
+        assert.match(checkpointBody, /lane_part_odd = next/u);
+      } else {
+        assert.match(checkpointBody, /const uint32_t p2 = v6 \^ v7;/u);
+        assert.match(checkpointBody, /lane_part \^= part;/u);
+      }
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-cuda-pair-"));
+      try {
+        for (const fixed of [false, true]) {
+          // The failed private prototype decoded this warp-major index as
+          // row-major 16x16 tiles. Keep that real defect as the negative control.
+          const inverse = fixed ? kernel.slice(inverseStart, inverseEnd) : [
+            "const uint32_t tile_row = tile / (n / 16u), tile_col = tile % (n / 16u);",
+            "const uint32_t row = row_offset + (tile_row / 4u) * 64u + (tile_row % 4u) * 2u;",
+            "const uint32_t col = (tile_col / 4u) * 64u + (tile_col % 4u) * 2u;",
+          ].join("\n");
+          fs.writeFileSync(path.join(fixture, "pair_dense_mapping_generated.h"), [
+            "#include <array>", "#include <cstdint>", "#include <cstdlib>",
+            "#ifndef CUTE_UNROLL", "#define CUTE_UNROLL", "#endif",
+            "namespace pair_mapping_actual {", "using std::uint8_t;",
+            "using std::uint32_t;", "using std::uint64_t;",
+            "struct Point { uint64_t row, col; };",
+            "inline Point actual_hash_inverse(uint64_t tile, uint32_t n, uint32_t row_offset) {",
+            inverse, "return {row,col}; }",
+            "inline uint64_t actual_dense_store_index(uint32_t block_m, uint32_t warp_m,",
+            "uint32_t block_n, uint32_t warp_n, uint32_t n, uint32_t lane) {",
+            kernel.slice(storeStart, storeEnd), "return dense_proof_index; }",
+            "inline uint32_t pearlhash_xor3(uint32_t a, uint32_t b, uint32_t c) {",
+            "return a ^ b ^ c; }",
+            "struct CheckpointAccumulator {",
+            "const std::array<uint32_t, 128>* values;",
+            "std::array<uint8_t, 128>* touched;",
+            "uint32_t operator()(int index) const {",
+            "if (index < 0 || index >= 128) std::abort();",
+            "++(*touched)[static_cast<unsigned>(index)];",
+            "return (*values)[static_cast<unsigned>(index)];",
+            "}", "};",
+            "inline uint32_t actual_checkpoint(const std::array<uint32_t, 128>& values,",
+            "std::array<uint8_t, 128>& touched) {",
+            "CheckpointAccumulator accumulator{&values, &touched};",
+            checkpointBody, "return lane_part; }",
+            `// extracted_source_kind=${checkpointKind}`, "}",
+          ].join("\n"));
+          const executable = path.join(fixture, "pair");
+          const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-pedantic", "-I" + fixture, path.join(__dirname, "native/pearlhash_cuda_pair.cpp"),
+            "-o", executable], {encoding: "utf8"});
+          assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+          const result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+          assert.equal(result.error, undefined);
+          assert.equal(result.signal, null);
+          assert.equal(result.status, fixed ? 0 : 1, result.stdout + result.stderr);
+          if (fixed) {
+            assert.match(result.stdout, /PASS pair_dense_mapping/u);
+          } else {
+            assert.match(result.stderr, /hash inverse disagrees with dense producer coordinate/u);
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash compact fixed-K dispatch preserves its ABI and generic fallback", () => {
+      const source = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/cuda_compact_kernel.inc"), "utf8");
+      const wrapper = extractCppBlock(source, 'extern "C" __global__ __launch_bounds__(256)');
+      const helper = extractCppBlock(source, "template<int FixedK>");
+      const names = ["eal", "ebr", "packed_indices", "a_second_compat_unused", "b_first_compat_unused",
+        "b_second_compat_unused", "seed", "b_seed", "m", "n", "k", "transcript_out", "key", "target",
+        "result", "row_offset", "debug_checksum"];
+      const signature = wrapper.slice(wrapper.indexOf("void compact_gemm(") + "void compact_gemm(".length,
+        wrapper.indexOf(") {"));
+      assert.deepEqual(signature.split(",").map(part => part.trim().match(/\w+$/u)?.[0]), names);
+      assert.equal((source.match(/__shared__ ReconstructSharedStorage \w+;/gu) || []).length, 1);
+      assert.doesNotMatch(helper, /__shared__/u);
+      const start = wrapper.indexOf("  if (k == 65536)");
+      assert.ok(start > wrapper.indexOf("__shared__ ReconstructSharedStorage storage;"));
+      const pragma = wrapper.indexOf('asm volatile(".pragma');
+      assert.ok(pragma >= 0 && pragma < start);
+      const dispatch = wrapper.slice(start, wrapper.lastIndexOf("}"));
+      const binding = helper.match(/const int k = ([^;\n]+);/u)?.[1];
+      assert.ok(binding);
+      // Execute the actual scalar dispatch/argument list, not a second hand-written selector.
+      // This CPU-only fixture deliberately does not emulate the CUDA numerical body.
+      const exercise = (/** @type {string} */ body) => {
+        const calls = [...body.matchAll(/compact_gemm_impl<(\d+)>\(([^;]+)\);/gu)];
+        assert.equal(calls.length, 2);
+        const js = body.replace(/compact_gemm_impl<(\d+)>\(([^;]+)\);/gu,
+          "return {fixed:$1,args:[$2]};");
+        const invoke = runInNewContext(`((${names.join(",")}) => { const storage={fixture:true}; ${js} })`);
+        const effective = runInNewContext(`((FixedK,input_k) => (${binding}))`);
+        for (const k of [-2147483648, -1, 0, 1, 127, 128, 256, 2048, 4096, 8192,
+          65535, 65536, 65537, 2147483520, 2147483647]) {
+          const args = names.map((_, index) => index === 10 ? k : index + 100);
+          const result = invoke(...args);
+          assert.equal(result.fixed, k === 65536 ? 65536 : 0);
+          assert.equal(result.args[0].fixture, true);
+          assert.deepEqual(Array.from(result.args).slice(1), args);
+          assert.equal(effective(result.fixed, k), k);
+        }
+      };
+      exercise(dispatch);
+      const wrongGuard = dispatch.replace("k == 65536", "k == 8192");
+      const noFallback = dispatch.replace("compact_gemm_impl<0>", "compact_gemm_impl<65536>");
+      assert.notEqual(wrongGuard, dispatch);
+      assert.notEqual(noFallback, dispatch);
+      assert.throws(() => exercise(wrongGuard));
+      assert.throws(() => exercise(noFallback));
+    });
+
+    test("PearlHash initial selector partitions sixteen eight-lane groups and safely reuses scratch", () => {
+      const source = fs.readFileSync(path.join(__dirname,
+        "../sycl/pearlhash/cuda_compact_kernel.inc"), "utf8");
+      const exercise = (/** @type {string} */ code) => {
+        const prepare = extractCppBlock(code, "void selector_prepare(");
+        // Preserve C++ integer division while exercising its actual score/update in JS.
+        const scoreText = prepare.match(/score\+=([^;]+);/u)?.[1]?.replaceAll("lane/4", "(lane>>2)");
+        assert.ok(scoreText);
+        const score = runInNewContext(`((word,groups,counts,lane) => {
+          let score=0; for(let s=0;s<4;++s) {
+            const rank=(word>>>(8*s))&127; score+=${scoreText};
+          } return score;
+        })`);
+        const updateText = extractCppBlock(prepare, "      if(lane<4) {")
+          .replace("if(lane<4)", "")
+          .replace(/const unsigned /gu, "const ")
+          .replaceAll("winner/4", "(winner>>2)");
+        const update = runInNewContext(`((word,groups,counts,winner,lane) => ${updateText})`);
+        for (let rank = 0; rank < 120; ++rank) {
+          for (let winner = 0; winner < 16; ++winner) {
+            const groups = Array.from({length: 16}, () =>
+              Array.from({length: 4}, () => ({ranks: new Uint8Array(128)})));
+            const counts = Array.from({length: 16}, () =>
+              Array.from({length: 4}, () => new Uint8Array(8)));
+            const word = rank * 0x01010101;
+            assert.equal(score(word, groups, counts, winner), 26);
+            for (let repeat = 0; repeat < 3; ++repeat) {
+              for (let lane = 0; lane < 4; ++lane) {update(word, groups, counts, winner, lane);}
+              assert.equal(score(word, groups, counts, winner), 0);
+              for (let lane = 0; lane < 4; ++lane) {
+                assert.equal(counts[winner]?.[lane]?.[rank & 7], 1);
+              }
+            }
+            assert.equal(score((rank + 8) * 0x01010101, groups, counts, winner), 78);
+          }
+        }
+        const initialize = prepare.indexOf("seen_bytes[i]=0"), partition = prepare.indexOf("if(warp==0)");
+        const refinement = prepare.indexOf("swap_checkpoint(");
+        assert.ok(initialize >= 0 && partition > initialize && refinement > partition);
+        assert.ok(prepare.slice(initialize, partition).includes("__syncthreads()"));
+        assert.ok(prepare.slice(prepare.indexOf("++sizes[winner]"), refinement).includes("__syncthreads()"));
+        assert.ok(prepare.includes("reinterpret_cast<unsigned char*>(groups)"));
+        assert.ok(!prepare.includes("seen["));
+        assert.ok(prepare.includes("i<sizeof(groups);i+=128"));
+        assert.ok(prepare.includes("counts[16][4][8],sizes[16]"));
+        assert.ok(prepare.includes("if(lane<16&&sizes[lane]<8)"));
+        assert.ok(prepare.includes("ordered[winner*8+sizes[winner]]=word"));
+        assert.ok(prepare.includes("(score*9+sizes[lane])*16+lane"));
+        const swaps = extractCppBlock(code, "__device__ __forceinline__ uint32_t swap_checkpoint(");
+        assert.ok(swaps.includes("for(unsigned i=thread;i<sizeof(groups);i+=128)bytes[i]=0;"));
+        const pass = extractCppBlock(swaps, "  for(unsigned i=0;i<120;++i) {");
+        assert.equal((pass.match(/__syncthreads\(\);/gu) || []).length, 2);
+        assert.ok(!pass.includes("continue;"));
+        assert.ok(pass.indexOf("partner_words[warp]=selected;") < pass.indexOf("__syncthreads();"));
+        assert.ok(pass.includes("const uint32_t selected=__shfl_sync(0xffffffffu,word,local&31);"));
+        assert.ok(pass.lastIndexOf("__syncthreads();") > pass.indexOf("words[partner]=outgoing;"));
+      };
+      exercise(source);
+      for (const [from, to] of [["ranks[rank]?0:", "ranks[rank]?1:"],
+        ["if(!groups[winner][lane].ranks[rank])", "if(true)"],
+        ["seen_bytes[i]=0", "seen_bytes[i]=1"],
+        ["sizes[lane]<8", "sizes[lane]<32"],
+        ["winner*8+sizes[winner]", "winner*32+sizes[winner]"]]) {
+        assert.ok(typeof from === "string" && typeof to === "string");
+        assert.ok(source.includes(from));
+        assert.throws(() => exercise(source.replace(from, to)));
+      }
+    });
+
+    test("PearlHash selector swaps and score keys remain exact and bounded", () => {
+      const source = fs.readFileSync(path.join(__dirname,
+        "../sycl/pearlhash/cuda_compact_kernel.inc"), "utf8");
+      const exercise = (/** @type {string} */ code) => {
+        const body = (/** @type {string} */ signature) => {
+          const block = extractCppBlock(code, signature);
+          return block.slice(block.indexOf("{") + 1, block.lastIndexOf("}"))
+            .replace(/#pragma unroll/gu, "")
+            .replace(/for\(unsigned /gu, "for(let ")
+            .replace(/\bconst unsigned\b/gu, "const")
+            .replace(/\bunsigned\s+(?=[a-z])/gu, "let ")
+            .replace(/\bunsigned\(/gu, "Number(");
+        };
+        // These execute the actual scalar helpers, not the warp intrinsics.
+        // Every source group contains eight ranks, so removing an absent rank
+        // is deliberately outside this contract.
+        const context = {max: Math.max, Number};
+        const refresh = runInNewContext(`((g) => {${body("__device__ __forceinline__ void refresh(")}})`, context);
+        const swap = runInNewContext(`((g,outgoing,incoming) => {${body("__device__ __forceinline__ unsigned swap_max(")}})`, context);
+        const exchange = runInNewContext(`((g,outgoing,incoming) => {${body("__device__ __forceinline__ void exchange(")}})`,
+          {...context, refresh});
+        const group = (/** @type {number[]} */ values) => {
+          const ranks = new Uint8Array(128), banks = new Uint8Array(8);
+          for (const rank of values) {ranks[rank] = (ranks[rank] ?? 0) + 1;}
+          for (let rank = 0; rank < 128; ++rank) {
+            if (ranks[rank]) {banks[rank & 7] = (banks[rank & 7] ?? 0) + 1;}
+          }
+          const maximum = Math.max(...banks);
+          return {ranks, banks, maximum,
+            at_maximum: Array.from(banks).filter(value => value === maximum).length};
+        };
+        const fixtures = [Array(8).fill(0), Array.from({length: 8}, (_, i) => i),
+          Array.from({length: 8}, (_, i) => 8 * i), [0, 0, 8, 8, 16, 1, 1, 9]];
+        for (let seed = 0; seed < 12; ++seed) {
+          fixtures.push(Array.from({length: 8}, (_, i) =>
+            (Math.imul(seed + 17, i * 41 + 13) ^ (i << (seed & 3))) & 127));
+        }
+        for (const values of fixtures) {
+          for (let out = 0; out < values.length; ++out) {
+            for (let incoming = 0; incoming < 128; ++incoming) {
+              const original = group(values), next = values.slice();
+              next[out] = incoming;
+              const expected = group(next);
+              assert.equal(swap(original, values[out], incoming), expected.maximum);
+              exchange(original, values[out], incoming);
+              assert.deepEqual(original, expected);
+            }
+          }
+        }
+        const swaps = extractCppBlock(code, "__device__ __forceinline__ uint32_t swap_checkpoint(");
+        const prepare = extractCppBlock(code, "void selector_prepare(");
+        const weightTexts = [...code.matchAll(/\(((?:s|stream)<2\?\d+:\d+)\)/gu)].map(match => match[1]);
+        assert.equal(weightTexts.length, 2);
+        const weights = weightTexts.map(expression =>
+          runInNewContext(`((s,stream=s) => (${expression}))`));
+        const terms = Array.from({length: 4}, (_, s) => Number(weights[0](s)));
+        assert.deepEqual(terms, Array.from({length: 4}, (_, s) => Number(weights[1](s))));
+        assert.ok(terms.every(value => Number.isSafeInteger(value) && value > 0));
+        // One replacement changes each group's maximum by at most one.
+        const bound = 2 * terms.reduce((sum, value) => sum + value, 0);
+        assert.ok(bound < 256);
+        const keyText = swaps.match(/const unsigned local=__reduce_min_sync\(0xffffffffu,([^;\n]+)\);/u)?.[1];
+        const acceptText = swaps.match(/if\((\(key>>\d+\)<\d+)\) \{/u)?.[1];
+        assert.ok(keyText && acceptText);
+        const key = runInNewContext(`((delta,thread) => (${keyText.replace(/unsigned\(/gu, "Number(")}))`, {Number});
+        const accept = runInNewContext(`((key) => (${acceptText}))`);
+        for (let delta = -bound; delta <= bound; ++delta) {
+          for (let lane = 0; lane < 128; ++lane) {
+            const actual = Number(key(delta, lane));
+            assert.ok(Number.isSafeInteger(actual) && actual >= 0 && actual <= 0xffffffff);
+            assert.equal(Boolean(accept(actual)), delta < 0);
+            if (lane) {assert.ok(actual > key(delta, lane - 1));}
+          }
+        }
+        const greedyText = prepare.match(/key=(\([^;\n]*score[^;\n]+);/u)?.[1];
+        assert.ok(greedyText);
+        const greedy = runInNewContext(`((score,sizes,lane) => (${greedyText}))`);
+        const dimensions = prepare.match(/if\(lane<(\d+)&&sizes\[lane\]<(\d+)\)/u);
+        assert.ok(dimensions);
+        const bins = Number(dimensions[1]), capacity = Number(dimensions[2]);
+        assert.equal(bins * capacity, 128);
+        const maxScore = (2 * capacity + 1) * terms.reduce((sum, value) => sum + value, 0);
+        for (const score of [0, 1, maxScore]) {
+          for (let size = 0; size < capacity; ++size) {
+            for (let lane = 0; lane < bins; ++lane) {
+              const actual = Number(greedy(score, Array(bins).fill(size), lane));
+              assert.ok(Number.isSafeInteger(actual) && actual >= 0 && actual <= 0xffffffff);
+              assert.ok(actual < greedy(score + 1, Array(bins).fill(0), 0));
+              if (lane) {assert.ok(actual > greedy(score, Array(bins).fill(size), lane - 1));}
+              if (size) {assert.ok(actual > greedy(score, Array(bins).fill(size - 1), bins - 1));}
+            }
+          }
+        }
+      };
+      exercise(source);
+      for (const [from, to] of [["g.at_maximum==1", "g.at_maximum==0"],
+        ["b=incoming&7", "b=incoming&3"],
+        ["unsigned(delta+256)*128+thread", "unsigned(delta+256)*64+thread"]]) {
+        assert.ok(typeof from === "string" && typeof to === "string");
+        assert.ok(source.includes(from));
+        assert.throws(() => exercise(source.replace(from, to)));
+      }
+    });
+
+    require("./logic/pearlhash_compact");
+
+    test("PearlHash compact admission commits geometry only after native admission", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, async (t) => {
+      const root = path.join(__dirname, "../sycl/pearlhash");
+      const host = fs.readFileSync(path.join(root, "pearlhash.cpp"), "utf8");
+      const state = fs.readFileSync(path.join(root, "state.inc"), "utf8");
+      const policy = fs.readFileSync(path.join(root, "compact_policy.inc"), "utf8");
+      assert.doesNotMatch(extractCppBlock(state, "static Buffers alloc_buffers("), /CompactProfile::rows/u);
+      const begin = host.indexOf("  bool native_int8_route = false;");
+      const end = host.indexOf("\n  if (st.have_header &&", begin);
+      assert.ok(begin >= 0 && end > begin);
+      const admission = host.slice(begin, end);
+      const selected = extractCppBlock(host, "static bool selected(int m,int n,int k,int rank) {");
+      const shape = extractCppBlock(policy, "  static bool supports(int m, int n, int requested_k, int requested_rank) {");
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-compact-admission-"));
+      try {
+        fs.copyFileSync(path.join(__dirname, "native/pearlhash_compact_admission.cpp"), path.join(fixture, "test.cpp"));
+        const run = (/** @type {string} */ mode, /** @type {string} */ body,
+          /** @type {string} */ select, /** @type {RegExp | undefined} */ fail = undefined) => {
+          fs.writeFileSync(path.join(fixture, "admission.inc"), body);
+          fs.writeFileSync(path.join(fixture, "selected.inc"), select);
+          fs.writeFileSync(path.join(fixture, "shape.inc"), shape);
+          const executable = path.join(fixture, mode);
+          const built = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror", "-pedantic",
+            "-DMOM_SYCL_HAS_CUDA=1", "-DMOM_SYCL_HAS_HIP=1", "-I" + fixture, "-I" + root,
+            "-I" + path.join(__dirname, "../native"), path.join(fixture, "test.cpp"), "-o", executable], {encoding: "utf8"});
+          assert.equal(built.status, 0, built.error?.message || built.stderr);
+          const result = spawnSync(executable, [], {encoding: "utf8"});
+          assert.equal(result.status, fail ? 1 : 0, result.stdout + result.stderr);
+          if (fail) {assert.match(result.stderr, fail);} else {assert.match(result.stdout, /COMPACT_ADMISSION_PASS cases=32/u);}
+        };
+        await t.test("source-derived admission, stale-state reset and target scaling", () => run("healthy", admission, selected));
+        const flag = selected.replace("return CompactProfile::supports(m,n,k,rank);",
+          'return std::getenv("MOM_PRIVATE_COMPACT") && CompactProfile::supports(m,n,k,rank);');
+        assert.notEqual(flag, selected);
+        await t.test("old private-flag requirement really fails", () =>
+          run("private-flag", admission, flag, /private flag still required/u));
+        const eager = admission.replace("cuda_native_int8_route && st.cuda.compact", "compact_private::selected(m,n,k,rank)");
+        assert.notEqual(eager, admission);
+        await t.test("pre-admission geometry really fails", () =>
+          run("eager-geometry", eager, selected, /wrong compact admission/u));
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash shared matrices survive optional allocation faults", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "../sycl/pearlhash");
+      const state = fs.readFileSync(path.join(root, "state.inc"), "utf8");
+      const hip = fs.readFileSync(path.join(root, "hip_jit.inc"), "utf8");
+      const guardStart = hip.indexOf("    if (!b.Ap || !b.Bp)");
+      const guardEnd = hip.indexOf("    if (!mom_is_hip(", guardStart);
+      assert.ok(guardStart >= 0 && guardEnd > guardStart);
+      assert.doesNotMatch(hip, /b\.transcript|transcript_rows/u,
+        "HIP native admission must not depend on global transcript storage");
+      const allocation = extractCppBlock(state, "static Buffers alloc_buffers(");
+      const required = allocation.indexOf("b.result = sycl::malloc_shared<Result>");
+      const optional = allocation.indexOf("b.transcript = alloc_optional<uint32_t>");
+      assert.ok(required >= 0 && optional > required, "mandatory buffers must precede optional memory");
+      assert.doesNotMatch(state, /ApWmma|BpWmma|alloc_native_buffers/u);
+      assert.match(allocation, /b\.transcript = alloc_optional<uint32_t>/u);
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-allocation-"));
+      try {
+        fs.writeFileSync(path.join(fixture, "pearlhash_allocation_policy.inc"),
+          extractCppBlock(state, "static bool pearlhash_required_layout_admitted("));
+        fs.writeFileSync(path.join(fixture, "pearlhash_native_allocation.inc"), [
+          "template <typename T> static T* alloc_buffer(",
+          "template <typename T> static T* alloc_optional(",
+          "static void free_allocations(",
+        ].map(anchor => extractCppBlock(state, anchor)).join("\n"));
+        fs.writeFileSync(path.join(fixture, "hip-layout-admission.inc"),
+          hip.slice(guardStart, guardEnd) + "    return true;\n");
+        const executable = path.join(fixture, "allocation");
+        const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+          "-pedantic", "-I" + fixture, "-I" + path.join(__dirname, "../sycl"),
+          path.join(__dirname, "native/pearlhash_allocation.cpp"), "-o", executable], {encoding: "utf8"});
+        assert.equal(compiled.status, 0, compiled.stderr);
+        const result = spawnSync(executable, [], {encoding: "utf8"});
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.match(result.stdout, /allocation admission and native fallback passed/u);
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash HIP buffer loads preserve bounded packed input and gfx12 descriptor flags", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const source = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/hip_kernel.inc"), "utf8");
+      const helper = extractCppBlock(source, "template <int Tiles>\nDEV __amdgpu_buffer_rsrc_t");
+      const matrix = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/matrix.inc"), "utf8");
+      const loads = source.match(/[ab]\[[ij]\] = __builtin_amdgcn_raw_buffer_load_b64\([\s\S]*?\);/gu);
+      assert.equal(loads?.length, 2);
+      const [loadA, loadB] = loads || [];
+      assert.ok(loadA && loadB);
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-hip-buffer-"));
+      try {
+        fs.writeFileSync(path.join(fixture, "load-a.inc"), loadA);
+        fs.writeFileSync(path.join(fixture, "load-b.inc"), loadB);
+        fs.writeFileSync(path.join(fixture, "pack-offset.inc"),
+          extractCppBlock(matrix, "static inline size_t amd_wmma_offset("));
+        assert.match(source, /const int a_tiles = __builtin_amdgcn_readfirstlane/u);
+        assert.match(source, /const int b_tiles = __builtin_amdgcn_readfirstlane/u);
+        for (const k of [2048, 8192, 65536]) {
+          for (const [variant, expected] of /** @type {Array<[string, RegExp]>} */ ([
+            [helper, /PASS actual-source HIP resource/u],
+            [helper.replace("0x31004000u", "0u"), /invalid gfx12 resource/u],
+            [helper.replace("const int count = __builtin_amdgcn_readfirstlane(",
+              "const int count = ("), /must both be explicitly wave-uniform/u],
+          ])) {
+            fs.writeFileSync(path.join(fixture, "input-resource.inc"), variant);
+            const executable = path.join(fixture, "hip-buffer");
+            const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+              "-pedantic", `-DPEARLHASH_K=${k}`, "-I" + fixture,
+              path.join(__dirname, "native/pearlhash_hip_buffer.cpp"), "-o", executable], {encoding: "utf8"});
+            assert.equal(compiled.status, 0, compiled.stderr);
+            const result = spawnSync(executable, [], {encoding: "utf8"});
+            assert.equal(result.status, variant === helper ? 0 : 1, result.stdout + result.stderr);
+            assert.match(result.stdout + result.stderr, expected);
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash HIP fused checkpoint owners preserve reductions, direct slots, tails and coordinates", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const source = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/hip_kernel.inc"), "utf8");
+      const guardStart = source.indexOf("  static_assert(PEARLHASH_K > 0");
+      const guardEnd = source.indexOf("  const uint32_t wave =", guardStart);
+      assert.ok(guardStart >= 0 && guardEnd > guardStart);
+      const kernelGuard = source.slice(guardStart, guardEnd);
+      const guardContract = /static_assert\(PEARLHASH_EC == 4 &&[\s\S]*ER13 requires exactly sixteen checkpoint slots/u;
+      assert.match(kernelGuard, guardContract);
+      const proofCountStart = source.indexOf(
+        "  constexpr uint32_t proofs_per_wave = (uint32_t)PEARLHASH_ER * 4u;",
+      );
+      const proofCountEnd = source.indexOf("\n", proofCountStart);
+      const sharedStart = source.indexOf("  __shared__ uint32_t fused_transcript[", proofCountEnd);
+      const sharedEnd = source.indexOf("\n", sharedStart);
+      const proofCountDeclaration = source.slice(proofCountStart, proofCountEnd);
+      const sharedDeclaration = source.slice(sharedStart, sharedEnd);
+      const sharedExtent = sharedDeclaration.match(/\[([^\]]+)\]/u)?.[1];
+      const reductionStart = source.indexOf(
+        "      uint32_t reduced[PEARLHASH_ER][PEARLHASH_EC / 4] = {};",
+      );
+      const reductionEnd = source.indexOf("      const int slot = rc & 15;", reductionStart);
+      const ownerStart = reductionEnd;
+      const ownerEnd = source.indexOf("    }\n  }\n\n  // Wrapped checkpoint", ownerStart);
+      const finalStoreStart = source.indexOf("#if !PEARLHASH_DIRECT_SLOT", ownerEnd);
+      const finalStoreEnd = source.indexOf("  __syncthreads();", finalStoreStart);
+      const hashGuardStart = source.indexOf("active_wave && lane < proofs_per_wave", finalStoreEnd);
+      const hashGuardEnd = hashGuardStart + "active_wave && lane < proofs_per_wave".length;
+      const coordinatesStart = source.indexOf("    const uint32_t hash_i =", hashGuardEnd);
+      const coordinatesEnd = source.indexOf("    if (proof_row <", coordinatesStart);
+      const tailConditionStart = source.indexOf("(", coordinatesEnd);
+      const tailConditionEnd = source.indexOf(") {", tailConditionStart);
+      const tailCondition = source.slice(tailConditionStart + 1, tailConditionEnd);
+      assert.ok(reductionStart >= 0 && reductionEnd > reductionStart &&
+        ownerEnd > ownerStart && finalStoreStart > ownerEnd && finalStoreEnd > finalStoreStart &&
+        hashGuardStart > finalStoreEnd && hashGuardEnd > hashGuardStart &&
+        coordinatesStart > hashGuardEnd && coordinatesEnd > coordinatesStart &&
+        proofCountStart >= 0 && proofCountEnd > proofCountStart &&
+        sharedStart > proofCountEnd && sharedEnd > sharedStart && sharedExtent &&
+        tailConditionStart > coordinatesEnd && tailConditionEnd > tailConditionStart);
+      const reduction = source.slice(reductionStart, reductionEnd);
+      const owner = source.slice(ownerStart, ownerEnd);
+      const finalStore = source.slice(finalStoreStart, finalStoreEnd);
+      const hashGuard = source.slice(hashGuardStart, hashGuardEnd);
+      const hashCoordinates = source.slice(coordinatesStart, coordinatesEnd);
+      assert.match(source, /#define PEARLHASH_DIRECT_SLOT 1/u);
+      assert.match(proofCountDeclaration,
+        /constexpr uint32_t proofs_per_wave = \(uint32_t\)PEARLHASH_ER \* 4u;/u);
+      assert.equal(sharedExtent, "4 * PEARLHASH_ER * 4 * 16");
+      assert.match(owner, /fused_transcript\[wave_in_block \* proofs_per_wave \* 16u/u);
+      assert.match(owner, /tr\[i\]\[p\] = rotl32/u);
+      assert.match(finalStore, /#if !PEARLHASH_DIRECT_SLOT/u);
+      assert.equal(hashGuard, "active_wave && lane < proofs_per_wave");
+      assert.doesNotMatch(source, /hash_kernel/u);
+      assert.match(hashCoordinates, /hash_q \* 4u/u);
+      assert.doesNotMatch(reduction, /__shfl_xor/u,
+        "4x64 proofs are independent between all four quarter-waves");
+      const dpp = extractCppBlock(source, "template <int Mask>\nDEV uint32_t pearlhash_xor_dpp");
+      assert.match(dpp, /static_assert\(Mask == 1 \|\| Mask == 2 \|\| Mask == 4 \|\| Mask == 8/u);
+      assert.match(dpp, /v_xor_b32_dpp %0, %1, %1 row_xmask:%2 row_mask:0xf bank_mask:0xf bound_ctrl:0/u,
+        "fused DPP must retain complete 16-lane row/bank participation");
+      assert.deepEqual([...reduction.matchAll(/pearlhash_xor_dpp<(\d+)>/gu)].map(match => Number(match[1])),
+        [1, 2, 4, 8]);
+      assert.match(owner, /if \(active_wave && \(\(lane & 15\) == slot\)\)/u);
+      assert.match(tailCondition, /proof_row <[\s\S]*proof_col <[\s\S]*n/u);
+      assert.equal((source.match(/const uint64_t fragment =/gu) || []).length, 2,
+        "large matrices still need wide fallback offsets");
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-hip-transcript-"));
+      try {
+        fs.writeFileSync(path.join(fixture, "kernel-guard.inc"), kernelGuard);
+        fs.writeFileSync(path.join(fixture, "proofs-per-wave.inc"), proofCountDeclaration + "\n");
+        fs.writeFileSync(path.join(fixture, "shared-extent.inc"),
+          `constexpr size_t production_fused_transcript_words = ${sharedExtent};\n`);
+        fs.writeFileSync(path.join(fixture, "tail-guard.inc"),
+          `if (${tailCondition}) in_bounds = true;\n`);
+        for (const variant of ["valid", "reduction", "owner", "lds-index", "hashlane",
+          "hash-active", "coordinate"]) {
+          const valid = variant === "valid";
+          const reductionVariant = variant === "reduction" ? reduction.replace("e < 4", "e < 3") : reduction;
+          const ownerVariant = variant === "owner" ?
+            owner.replace("const uint32_t local_proof = (uint32_t)i * 4u + proof_quarter;",
+              "const uint32_t local_proof = (uint32_t)i * 4u + (proof_quarter ^ 1u);") :
+            variant === "lds-index" ? owner.replace("local_proof * 16u", "local_proof * 8u") : owner;
+          const hashGuardVariant = variant === "hashlane" ?
+            hashGuard.replace("lane < proofs_per_wave", "lane < proofs_per_wave - 4u") :
+            variant === "hash-active" ? hashGuard.replace("active_wave && ", "") : hashGuard;
+          const coordinatesVariant = variant === "coordinate" ?
+            hashCoordinates.replace("hash_q * 4u", "hash_q * 8u") : hashCoordinates;
+          assert.notEqual(reductionVariant, "", "fused reduction extraction is empty");
+          if (variant === "reduction") {
+            assert.notEqual(reductionVariant, reduction);
+          }
+          if (variant === "owner") {
+            assert.notEqual(ownerVariant, owner);
+          }
+          if (variant === "lds-index") {
+            assert.notEqual(ownerVariant, owner);
+          }
+          if (variant === "hash-active") {
+            assert.notEqual(hashGuardVariant, hashGuard);
+          }
+          if (variant === "coordinate") {
+            assert.notEqual(coordinatesVariant, hashCoordinates);
+          }
+          fs.writeFileSync(path.join(fixture, "checkpoint-owner.inc"), ownerVariant);
+          fs.writeFileSync(path.join(fixture, "final-store.inc"), finalStore);
+          fs.writeFileSync(path.join(fixture, "reduction.inc"), reductionVariant);
+          fs.writeFileSync(path.join(fixture, "hash-guard.inc"), hashGuardVariant);
+          fs.writeFileSync(path.join(fixture, "hash-coordinates.inc"), coordinatesVariant);
+          for (const profile of [
+            ["ER12-q16", 12, 2048, 128], ["ER12-q32", 12, 4096, 128],
+            ["ER12-q64", 12, 8192, 128], ["ER13-q16-a", 13, 2048, 128],
+            ["ER13-q16-b", 13, 4096, 256],
+          ]) {
+            const [name, er, k, rank] = profile;
+            const executable = path.join(fixture, `hip-transcript-${name}`);
+            const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+              "-Wno-unused-parameter", "-Wno-range-loop-construct", "-Wno-unknown-pragmas",
+              "-pedantic", `-DPEARLHASH_ER=${er}`, "-DPEARLHASH_EC=4", `-DPEARLHASH_K=${k}`,
+              `-DPEARLHASH_RANK=${rank}`, "-I" + fixture,
+              path.join(__dirname, "native/pearlhash_hip_transcript.cpp"), "-o", executable],
+            {encoding: "utf8"});
+            assert.equal(compiled.status, 0, `${variant}/${name}: ${compiled.stderr}`);
+            const result = spawnSync(executable, [], {encoding: "utf8"});
+            const direct = er === 13;
+            const broken = variant === "reduction" || variant === "hashlane" ||
+              variant === "hash-active" || variant === "coordinate" ||
+              (direct && (variant === "owner" || variant === "lds-index"));
+            const expectedStatus = valid || !broken ? 0 : 1;
+            assert.equal(result.status, expectedStatus, `${variant}/${name}: ${result.stdout}${result.stderr}`);
+            assert.match(result.stdout + result.stderr, expectedStatus === 0 ?
+              /CPU fused oracle passed: ER=/u :
+              /reduction differs|hash lane guard|fused hash coordinate|fused LDS proof index|active fused LDS slot|inactive wave reached/u);
+          }
+          if (valid) {
+            for (const [name, k, rank] of [["ER13-q32", 4096, 128],
+              ["ER13-truncated", 4160, 256],
+              ["ER13-wrap", 4352, 256]]) {
+              const rejected = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+                "-Wno-unused-parameter", "-Wno-range-loop-construct", "-Wno-unknown-pragmas",
+                "-pedantic", "-DPEARLHASH_ER=13", "-DPEARLHASH_EC=4", `-DPEARLHASH_K=${k}`,
+                `-DPEARLHASH_RANK=${rank}`, "-I" + fixture,
+                path.join(__dirname, "native/pearlhash_hip_transcript.cpp"),
+                "-o", path.join(fixture, `hip-transcript-${name}`)], {encoding: "utf8"});
+              assert.notEqual(rejected.status, 0, `${name} must fail closed at compile time`);
+              assert.match(rejected.stderr, /ER13 requires exactly sixteen checkpoint slots/u);
+            }
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash HIP reuses bounded row slices without changing global proof coordinates", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "../sycl/pearlhash");
+      const source = fs.readFileSync(path.join(root, "hip_jit.inc"), "utf8");
+      const kernel = fs.readFileSync(path.join(root, "hip_kernel.inc"), "utf8");
+      const state = fs.readFileSync(path.join(root, "state.inc"), "utf8");
+      const matrix = fs.readFileSync(path.join(root, "matrix.inc"), "utf8");
+      const selectorStart = source.indexOf("      tile_er = k / rank == 16 ? 13 : 12;");
+      const selectorEnd = source.indexOf("\n", selectorStart);
+      assert.ok(selectorStart >= 0 && selectorEnd > selectorStart);
+      const selector = source.slice(selectorStart, selectorEnd);
+      assert.doesNotMatch(source, /hipMalloc\(|hipFree\(/,
+        "HIP must share the existing SYCL transcript owner, not retain a quadratic allocation");
+      assert.doesNotMatch(source, /hash_kernel/u,
+        "fused HIP must not retain the removed second hash entry point");
+      assert.match(source, /hipModuleGetFunction\(&kernel, module, "pearlhash_wmma_hash_fused"\)/u);
+      assert.match(source,
+        /void\* fused_args\[\]\s*=\s*\{\s*&A,\s*&B,\s*&key,\s*&target,\s*&result,\s*&seed,\s*&rows,\s*&n,\s*&row_offset,\s*&debug_int\s*\}/u);
+      assert.match(state,
+        /const int transcript_rows = cuda_jit[\s\S]*?: hip_jit \? 0 : m;/u,
+        "HIP fused storage must remain entirely in LDS");
+      assert.match(state, /if \(\(cuda_jit \|\| !hip_jit\) && transcript_bytes > 0/u);
+      assert.doesNotMatch(source, /b\.transcript|transcript_rows/u,
+        "HIP JIT must not retain a global transcript gate");
+      assert.match(kernel, /__shared__ uint32_t fused_transcript\[4 \* PEARLHASH_ER \* 4 \* 16\]/u);
+      assert.match(kernel, /if \(active_wave && lane < proofs_per_wave\)/u);
+      assert.match(kernel,
+        /constexpr int cache_rows = 131072 \/ PEARLHASH_K < 16 \? 16 :[\s\S]*131072 \/ PEARLHASH_K > 64 \? 64/u,
+        "HIP wave grouping must clamp its compile-time cache rows");
+      assert.match(source, /const int cache_rows = std::max\(16, std::min\(64, 131072 \/ k\)\)/u,
+        "HIP host chunks must use the same cache-row clamp");
+      assert.match(matrix, /static inline size_t amd_wmma_offset\(/u);
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-hip-slices-"));
+      try {
+        fs.writeFileSync(path.join(fixture, "hip-launch.inc"), extractCppBlock(source, "  void launch("));
+        fs.writeFileSync(path.join(fixture, "hip-wait.inc"), extractCppBlock(source, "  void wait(double learned_us)"));
+        fs.writeFileSync(path.join(fixture, "hip-selector.inc"), selector + "\n");
+        fs.writeFileSync(path.join(fixture, "hip-wave-groups.inc"), extractCppBlock(kernel, "DEV void wave_groups("));
+        fs.writeFileSync(path.join(fixture, "matrix-offset.inc"),
+          extractCppBlock(matrix, "static inline size_t amd_wmma_offset("));
+        const allocationStart = state.indexOf("    const uint64_t transcript_limit =");
+        const allocationEnd = state.indexOf("    const bool transcript_fits =", allocationStart);
+        assert.ok(allocationStart >= 0 && allocationEnd > allocationStart);
+        fs.writeFileSync(path.join(fixture, "transcript-allocation.inc"), state.slice(allocationStart, allocationEnd));
+        const executable = path.join(fixture, "slices");
+        for (const er of [12, 13]) {
+          for (const k of [1024, 2048, 3072, 4096, 5632, 8192, 16384]) {
+            const compile = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+              "-Wno-unused-parameter", "-Wno-range-loop-construct", "-pedantic", "-I" + fixture,
+              `-DPEARLHASH_ER=${er}`, "-DPEARLHASH_K=" + k,
+              path.join(__dirname, "native/pearlhash_hip_slices.cpp"), "-o", executable],
+            {encoding: "utf8"});
+            assert.equal(compile.status, 0, `ER${er}/K${k}: ${compile.stderr}`);
+            const result = spawnSync(executable, [], {encoding: "utf8"});
+            assert.equal(result.status, 0, `ER${er}/K${k}: ${result.stderr}`);
+            const cacheRows = Math.max(16, Math.min(64, Math.floor(131072 / k)));
+            const chunkRows = cacheRows * er * 16;
+            assert.match(result.stdout,
+              new RegExp(`CPU fused launch oracle passed: K=${k} cache_rows=${cacheRows} chunk_rows=${chunkRows}`));
+          }
+        }
       } finally {
         fs.rmSync(fixture, {recursive: true, force: true});
       }
@@ -5765,7 +7162,47 @@ int main(int argc, char** argv) {
       }
     });
 
-    test("PearlHash submitted native faults propagate without fallback", {
+    test("PearlHash split queues retire independently before retry", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const production = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/pearlhash.cpp"), "utf8");
+      const attempt = production.indexOf("    attempt_start =");
+      const start = production.indexOf("\n  } catch (...)", attempt);
+      assert.ok(attempt >= 0 && start > attempt);
+      // Retire only the catch block, independent of whichever success-path code follows it.
+      const catchBody = production.slice(production.indexOf("catch (...)", start));
+      const block = "  } " + extractCppBlock(catchBody, "catch (...)");
+      const prep = 'sycl_cleanup_noexcept("pearlhash preparation", [&] { st.prep_queue.wait_and_throw(); });';
+      assert.ok(block.includes(prep));
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-split-cleanup-"));
+      try {
+        const source = path.join(fixture, "fixture.cpp");
+        const executable = path.join(fixture, "probe");
+        fs.copyFileSync(path.join(__dirname, "native/pearlhash_split_cleanup.cpp"), source);
+        for (const fixed of [false, true]) {
+          fs.writeFileSync(path.join(fixture, "catch.inc"), fixed ? block : block.replace(prep, ""));
+          const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-pedantic", source, "-o", executable], {encoding: "utf8"});
+          assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+          for (const [targetFault, prepFault] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+            const result = spawnSync(executable, [String(targetFault), String(prepFault)],
+              {encoding: "utf8", timeout: 2000});
+            assert.equal(result.error, undefined);
+            assert.equal(result.signal, null);
+            assert.equal(result.status, fixed ? 0 : 1, result.stderr);
+            if (fixed) {
+              assert.equal(result.stdout, "PASS PearlHash split preparation cleanup\n");
+            } else {
+              assert.match(result.stderr, /both queue cleanups/);
+            }
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("PearlHash submitted legacy native faults propagate without fallback", {
       skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
     }, async (t) => {
       const root = path.join(__dirname, "../sycl/pearlhash");
@@ -5780,31 +7217,128 @@ int main(int argc, char** argv) {
       const uploadEnd = host.indexOf("  if (is_test && q.get_device().is_gpu())", waitStart);
       const drainStart = host.indexOf("\n  } catch (...)", waitStart);
       const waitEnd = drainStart < 0 ? uploadEnd : drainStart;
+      const stateStart = host.indexOf("  const bool prior_fixed_b_valid = st.fixed_b_valid;");
+      const stateEnd = host.indexOf("\n\n  const bool native_requested", stateStart);
       const uploadStart = Math.min(host.indexOf("  if (!st.have_header ||"),
         host.indexOf("  uint8_t tgtLE[32];"));
       const readbackEnd = host.indexOf("  // search() retains", uploadEnd);
       const commitStart = host.indexOf("  if (!b.result->found)", waitEnd);
       const commitEnd = host.indexOf("\n}\n// Builds", commitStart);
+      const commitFixedStart = host.indexOf("  const auto commit_fixed_b = [&] {", waitEnd);
+      const commitFixedEnd = host.indexOf("\n  if (is_test &&", commitFixedStart);
+      const pairModeStart = host.indexOf(
+        "  if (st.have_header && st.header_pair_dist8 != pair_dist8)", stateEnd);
+      const pairModeEnd = host.indexOf("  bool reuse_fixed_b = false;", pairModeStart);
+      const pairReuseDeclEnd = host.indexOf("\n", pairModeEnd) + 1;
+      const pairHeaderStart = host.indexOf("    if (!st.have_header ||", pairModeEnd);
+      const pairReuseStart = host.indexOf("    reuse_fixed_b = pair_dist8", pairHeaderStart);
+      const pairReuseEnd = host.indexOf(";\n", pairReuseStart) + 2;
+      const fixedSeedStart = host.indexOf(
+        "    // The producer needs the selected B seed before it submits roots/noise/packing.",
+        pairReuseEnd);
+      const fixedSeedAssignment = "    b.fixed_b_seed = reuse_fixed_b ? prior_fixed_b_seed : attempt_seed;";
+      const fixedSeedEnd = host.indexOf(fixedSeedAssignment, fixedSeedStart) + fixedSeedAssignment.length;
+      const pairCatchStart = host.indexOf("catch (...)", waitEnd);
+      const pairCatch = extractCppBlock(host.slice(pairCatchStart), "catch (...)");
       assert.ok(invalidateStart > 0 && invalidateEnd > invalidateStart &&
-      waitStart > invalidateEnd && waitEnd > waitStart && commitStart > waitEnd && commitEnd > commitStart &&
-      uploadStart > invalidateEnd && uploadEnd >= waitEnd && readbackEnd > uploadEnd);
+      waitStart > invalidateEnd && waitEnd > waitStart && stateStart > 0 && stateEnd > stateStart &&
+      commitStart > waitEnd && commitEnd > commitStart && commitFixedStart > waitEnd &&
+      commitFixedEnd > commitFixedStart &&
+      uploadStart > invalidateEnd && uploadEnd >= waitEnd && readbackEnd > uploadEnd &&
+      pairModeStart > stateEnd && pairModeEnd > pairModeStart && pairHeaderStart > pairModeEnd &&
+      pairReuseStart > pairHeaderStart && pairReuseEnd > pairReuseStart &&
+      fixedSeedStart > pairReuseEnd && fixedSeedEnd > fixedSeedStart && pairCatchStart > waitEnd &&
+      pairCatch.length > 0);
       const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-pearl-native-fault-"));
       const source = path.join(fixture, "pearlhash_fault.cpp");
       const executable = path.join(fixture, "pearlhash_fault");
+      const mutantExecutable = path.join(fixture, "pearlhash_fault_mutant");
       try {
         fs.copyFileSync(path.join(__dirname, "native/pearlhash_fault.cpp"), source);
-        fs.writeFileSync(path.join(fixture, "dispatch.inc"), dispatch);
+        fs.copyFileSync(path.join(root, "claim.h"), path.join(fixture, "claim.h"));
+        // This fixture exercises the legacy pair and HIP/CUDA lifecycle, not compact root caching.
+        // Specialize only the distinct compact blocks away; retain actual legacy operations,
+        // target conversion, exception boundaries, and the compiled stale-header negative.
+        const compactRoots = extractCppBlock(host, "    if (compact_mode && reuse_fixed_b) {");
+        const compactCapture = extractCppBlock(host, "  if (compact_mode && !reuse_fixed_b) {");
+        const compactWinner = extractCppBlock(host, "  if (compact_mode) {").trimEnd() + " else ";
+        assert.equal(host.split(compactWinner).length, 2);
+        const legacyCommit = host.slice(commitStart, commitEnd).replace(compactWinner, "  ");
+        assert.doesNotMatch(legacyCommit, /compact_mode|compact_roots/u);
+        const compactKey = "if (compact_mode)\n        CompactProfile::derive_key(input,st.key);\n      else if (pair_dist8)";
+        assert.equal(host.split(compactKey).length, 2);
+        const legacyUpload = host.slice(uploadStart, uploadEnd)
+          .replace("    sycl::event compact_roots_ready;\n", "")
+          .replace(compactRoots, "")
+          .replace(compactCapture, "")
+          .replace(compactKey, "if (pair_dist8)")
+          .replace("compact_mode && reuse_fixed_b ? &compact_roots_ready : nullptr", "nullptr");
+        assert.doesNotMatch(legacyUpload, /compact_mode|CompactProfile|compact_roots_ready/u);
+        const legacyCommitFixed = host.slice(commitFixedStart, commitFixedEnd)
+          .replace(compactCapture, "");
+        assert.doesNotMatch(legacyCommitFixed, /compact_mode|compact_roots/u);
+        const compactDispatch = extractCppBlock(dispatch, "    if (cuda->compact) {").trimEnd() + " else ";
+        assert.equal(dispatch.split(compactDispatch).length, 2);
+        fs.writeFileSync(path.join(fixture, "dispatch.inc"), dispatch.replace(compactDispatch, "    "));
         fs.writeFileSync(path.join(fixture, "invalidate.inc"), host.slice(invalidateStart, invalidateEnd));
+        fs.writeFileSync(path.join(fixture, "state-invalidation.inc"), host.slice(stateStart, stateEnd));
         fs.writeFileSync(path.join(fixture, "wait.inc"), host.slice(waitStart, waitEnd));
-        fs.writeFileSync(path.join(fixture, "upload.inc"), host.slice(uploadStart, uploadEnd));
+        fs.writeFileSync(path.join(fixture, "upload.inc"), legacyUpload);
         fs.writeFileSync(path.join(fixture, "readback.inc"), host.slice(uploadEnd, readbackEnd));
-        fs.writeFileSync(path.join(fixture, "commit.inc"), host.slice(commitStart, commitEnd));
+        fs.writeFileSync(path.join(fixture, "commit-fixed-b.inc"),
+          legacyCommitFixed);
+        fs.writeFileSync(path.join(fixture, "commit.inc"), legacyCommit);
+        const pairHeader = host.slice(pairModeStart, pairModeEnd) +
+          host.slice(pairModeEnd, pairReuseDeclEnd) +
+          host.slice(pairHeaderStart, pairReuseEnd).replace(compactKey, "if (pair_dist8)");
+        fs.writeFileSync(path.join(fixture, "pair-header.inc"), pairHeader);
+        fs.writeFileSync(path.join(fixture, "fixed-b-seed.inc"),
+          host.slice(fixedSeedStart, fixedSeedEnd));
+        fs.writeFileSync(path.join(fixture, "pair-catch.inc"), pairCatch);
         const compiled = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
           "-pedantic", "-DMOM_SYCL_HAS_CUDA=1", "-DMOM_SYCL_HAS_HIP=1", source, "-o", executable],
         {encoding: "utf8"});
         assert.equal(compiled.error, undefined);
         assert.equal(compiled.signal, null);
         assert.equal(compiled.status, 0, compiled.stderr);
+        await t.test("CUDA pair decline after key admission cannot fall back", () => {
+          const result = spawnSync(executable, ["pair", "0", "0", "0"], {encoding: "utf8"});
+          assert.equal(result.error, undefined);
+          assert.equal(result.status, 0, result.stderr);
+          assert.equal(result.signal, null);
+          assert.equal(result.stdout, "PASS actual-source Pearl pair decline fails closed\n");
+        });
+        await t.test("CUDA pair fixed-B miss, hit, invalidation, and fault stay source-consistent", () => {
+          const result = spawnSync(executable, ["pair-lifecycle", "0", "0", "0"],
+            {encoding: "utf8", timeout: 5000});
+          assert.equal(result.error, undefined);
+          assert.equal(result.status, 0, result.stdout + result.stderr);
+          assert.equal(result.signal, null);
+          assert.equal(result.stdout, "PASS actual-source Pearl pair fixed-B lifecycle\n");
+        });
+        await t.test("CUDA pair header-invalidation mutation is rejected", () => {
+          const headerInvalidation = "      st.have_header = false;\n";
+          assert.equal(pairHeader.split(headerInvalidation).length, 2,
+            "fixture must contain one extracted header invalidation assignment");
+          try {
+            fs.writeFileSync(path.join(fixture, "pair-header.inc"),
+              pairHeader.replace(headerInvalidation, "      /* mutated: stale header state */\n"));
+            const mutant = spawnSync("c++", ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Werror",
+              "-pedantic", "-DMOM_SYCL_HAS_CUDA=1", "-DMOM_SYCL_HAS_HIP=1", source, "-o", mutantExecutable],
+            {encoding: "utf8"});
+            assert.equal(mutant.error, undefined);
+            assert.equal(mutant.signal, null);
+            assert.equal(mutant.status, 0, mutant.stderr);
+            const result = spawnSync(mutantExecutable, ["pair-lifecycle", "0", "0", "0"],
+              {encoding: "utf8", timeout: 5000});
+            assert.equal(result.error, undefined);
+            assert.notEqual(result.status, 0, "stale-header mutant unexpectedly passed");
+            assert.equal(result.signal, null);
+            assert.match(result.stderr, /header change reused fixed B/u);
+          } finally {
+            fs.writeFileSync(path.join(fixture, "pair-header.inc"), pairHeader);
+          }
+        });
         const cases = [];
         for (const [hip, name] of ["CUDA", "HIP"].entries()) {
           cases.push({dispatch: 0, hip, stage: 0, stringError: 0, name: name + " wait succeeds"});
@@ -5812,7 +7346,9 @@ int main(int argc, char** argv) {
           cases.push({dispatch: 1, hip, stage: 1, stringError: 0, name: name + " unavailable JIT retains SYCL"});
           for (const [stringError, error] of ["std::exception", "std::string"].entries()) {
             cases.push({dispatch: 0, hip, stage: 7, stringError, name: name + " wait propagates " + error});
-            for (const [stage, operation] of [[2, "queue wait"], [3, "preparation"], [6, "launch"]]) {
+            const operations = hip ? [[3, "preparation"], [6, "launch"]] :
+              [[2, "queue wait"], [3, "preparation"], [6, "launch"]];
+            for (const [stage, operation] of operations) {
               cases.push({dispatch: 1, hip, stage, stringError,
                 name: name + " " + operation + " propagates " + error});
             }
@@ -6330,6 +7866,23 @@ int main(int argc, char** argv) {
               }
             }
           });
+          await t.test((layout ? "Packed" : "Wide") + " accepted readback faults", {concurrency: false}, async (copyTest) => {
+            for (const copy of [3, 4, 7]) {
+              for (const [kind, error] of ["std::exception", "std::string", "unknown"].entries()) {
+                for (const cleanupError of [0, 1]) {
+                  await copyTest.test("copy " + copy + ": " + error + (cleanupError ? " with cleanup fault" : ""), () => {
+                    const result = spawnSync(executable,
+                      ["copies", String(copy), String(kind), String(cleanupError), String(layout), "after-enqueue"],
+                      {encoding: "utf8", timeout: 5000});
+                    assert.equal(result.error, undefined);
+                    assert.equal(result.signal, null);
+                    assert.equal(result.status, 0, result.stderr);
+                    assert.equal(result.stdout, "PASS actual-source C30 asynchronous completion boundary\n");
+                  });
+                }
+              }
+            }
+          });
         }
       } finally {
         fs.rmSync(fixture, {recursive: true, force: true});
@@ -6354,7 +7907,7 @@ int main(int argc, char** argv) {
       };
       const completeSearch = search.slice(search.indexOf("struct C29SearchCompletionGuard {"));
       assert.ok(completeSearch.startsWith("struct C29SearchCompletionGuard {"));
-      assert.equal(completeSearch.split("std::thread(").length, 2);
+      assert.equal(completeSearch.split("std::async(").length, 2);
       const catchStart = execution.indexOf("      } catch (const std::string& err) {",
         execution.indexOf("switch (m_dev)"));
       const catchEnd = execution.indexOf("      if (loop_stats)", catchStart);
@@ -6365,7 +7918,7 @@ int main(int argc, char** argv) {
       try {
         fs.copyFileSync(path.join(__dirname, "native/c29_submitted_fault.cpp"), source);
         fs.writeFileSync(path.join(fixture, "search.inc"),
-          completeSearch.replace("std::thread(", "TestThread(") + "\n#include \"entry.inc\"\n");
+          completeSearch.replace("std::async(", "TestAsync(") + "\n#include \"entry.inc\"\n");
         fs.writeFileSync(path.join(fixture, "entry.inc"), extractCppBlock(entry, "int c29("));
         fs.writeFileSync(path.join(fixture, "result-state.inc"),
           extract(state, "struct C29QueuedSolution {", "static sycl::async_handler c29_exception_handler()"));
@@ -6378,7 +7931,8 @@ int main(int argc, char** argv) {
         "const sycl::event tail_event{};\nuint32_t trimmed_edge_count = 0;\n" +
         "sycl::buffer<uint32_t, 1> buffer_trimmed_edge_count{sycl::range<1>{1}};\n" +
         "sycl::buffer<sycl::uint2, 1> buffer_trimmed_edges_u2{sycl::range<1>{64}};\n" +
-        extract(trim, "profile.mark(\"before tail wait\");", "profile.finish(trimmed_edge_count);") +
+        extract(trim, "profile.mark(\"before tail wait\");", "profile.finish(trimmed_edge_count);")
+          .replace("std::vector<sycl::uint2> trimmed_edges", "GraphEdges trimmed_edges") +
         "profile.finish(trimmed_edge_count);\n");
         fs.writeFileSync(path.join(fixture, "active-guard.inc"),
           extract(execution, "    if (!m_has_fn) {", "\n    { // A compute function is active"));
@@ -6412,8 +7966,283 @@ int main(int argc, char** argv) {
 
           });
         }
+        await t.test("Proof recovery completion", {concurrency: false}, async (recoveryTest) => {
+          for (const proof of [32, 42]) {
+            for (const [mode, name] of [[8, " waits before readback"], [9, " fault preserves output"],
+              [10, " uses the cached device"]]) {
+              await recoveryTest.test("proof" + proof + name, () => {
+                const result = spawnSync(executable, [String(mode), String(proof), "0"], {encoding: "utf8"});
+                assert.equal(result.status, 0, result.stderr);
+                assert.match(result.stdout, /PASS actual-source C29 submitted fault boundary\n$/);
+              });
+            }
+          }
+          const wait = "sycl_wait_and_throw(recovery_event, state.device);";
+          assert.ok(entry.includes(wait));
+          fs.writeFileSync(path.join(fixture, "entry.inc"),
+            extractCppBlock(entry, "int c29(").replace(wait, "(void)recovery_event;"));
+          const negative = spawnSync("c++", ["-std=c++17", "-O2", source, "-o", executable], {encoding: "utf8"});
+          assert.equal(negative.status, 0, negative.stderr);
+          const result = spawnSync(executable, ["8", "32", "0"], {encoding: "utf8"});
+          assert.equal(result.status, 1);
+          assert.match(result.stderr, /recovery readback bypassed the low-CPU completion boundary/);
+          fs.writeFileSync(path.join(fixture, "entry.inc"),
+            extractCppBlock(entry, "int c29(").replace(wait,
+              "sycl_wait_and_throw(recovery_event, compute_queue.get_device());"));
+          const queryControl = spawnSync("c++", ["-std=c++17", "-O2", source, "-o", executable], {encoding: "utf8"});
+          assert.equal(queryControl.status, 0, queryControl.stderr);
+          const queried = spawnSync(executable, ["10", "32", "0"], {encoding: "utf8"});
+          assert.equal(queried.status, 1);
+          assert.match(queried.stderr, /recovery fault was swallowed/);
+          fs.writeFileSync(path.join(fixture, "entry.inc"), extractCppBlock(entry, "int c29("));
+          const move = "trimmed_edges = std::move(trimmed_edges),";
+          assert.ok(completeSearch.includes(move));
+          fs.writeFileSync(path.join(fixture, "search.inc"),
+            completeSearch.replace("std::async(", "TestAsync(").replace(move, "") + "\n#include \"entry.inc\"\n");
+          const copyControl = spawnSync("c++", ["-std=c++17", "-O2", source, "-o", executable], {encoding: "utf8"});
+          assert.equal(copyControl.status, 0, copyControl.stderr);
+          const copied = spawnSync(executable, ["0", "32", "0"], {encoding: "utf8"});
+          assert.equal(copied.status, 1);
+          assert.match(copied.stderr, /cycle thread copied the retired graph/);
+        });
       } finally {
         fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("HooHash and Beam nested readbacks retain local owners through faults", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "../sycl");
+      const hoo = fs.readFileSync(path.join(root, "hoohash/hoohash.cpp"), "utf8");
+      const beam = fs.readFileSync(path.join(root, "beamhash3/beamhash3.cpp"), "utf8");
+      const library = fs.readFileSync(path.join(root, "lib-internal.h"), "utf8");
+      const results = [...hoo.matchAll(/Result result;\s+MomSyclHostTransferGuard result_transfer[^\n]+\n\s*sycl_wait_and_throw\(state\.queue\.memcpy\(&result\.offset,[^\n]+/g)];
+      assert.equal(results.length, 2, "both test and mining readbacks need local ownership");
+      const start = beam.indexOf("std::vector<uint32_t> ns(NBUCKETS);");
+      const end = beam.indexOf("for (uint32_t v : ns)", start);
+      assert.ok(start >= 0 && end > start);
+      const routes = [
+        ...results.map(match => ({id: 1, entry: match[0]})),
+        {id: 2, entry: beam.slice(start, end).replace("std::vector", "TrackedVector")},
+      ];
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-nested-local-readback-"));
+      try {
+        const source = path.join(fixture, "readback.cpp"), executable = path.join(fixture, "probe");
+        fs.copyFileSync(path.join(__dirname, "native/nested_readback_lifetime.cpp"), source);
+        const cleanupStart = library.indexOf("inline void sycl_log_cleanup_exception(");
+        const cleanupEnd = library.indexOf("sycl::device get_dev(", cleanupStart);
+        assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart);
+        fs.writeFileSync(path.join(fixture, "cleanup.inc"), library.slice(cleanupStart, cleanupEnd));
+        for (const route of routes) {
+          const guard = /\s*MomSyclHostTransferGuard (?:result_transfer|bucket_count_transfer)[^\n]+\n/;
+          assert.match(route.entry, guard);
+          for (const fixed of [false, true]) {
+            fs.writeFileSync(path.join(fixture, "entry.inc"), fixed ? route.entry : route.entry.replace(guard, "\n"));
+            const compiled = spawnSync("c++", ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", "-pedantic",
+              "-DMOM_NESTED_ROUTE=" + route.id, source, "-o", executable], {encoding: "utf8"});
+            assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+            for (const [fault, secondary] of [[0, 0], [1, 0], [1, 1], [2, 0], [2, 1]]) {
+              const result = spawnSync(executable, [String(fault), String(secondary)],
+                {encoding: "utf8", timeout: 5000});
+              assert.equal(result.error, undefined);
+              assert.equal(result.status, !fixed && fault ? 1 : 0, result.stdout + result.stderr);
+              if (!fixed && fault) {
+                assert.match(result.stderr, /nested readback left an accepted copy pending/);
+              } else {
+                assert.match(result.stdout, /^PASS nested readback route=/);
+              }
+            }
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("GPU cache uploads retain local sources through faults", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, async (t) => {
+      const root = path.join(__dirname, "../sycl");
+      const library = fs.readFileSync(path.join(root, "lib-internal.h"), "utf8");
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-cache-upload-lifetime-"));
+      const source = path.join(fixture, "cache_upload_lifetime.cpp");
+      const executable = path.join(fixture, "probe");
+      const cleanupStart = library.indexOf("inline void sycl_log_cleanup_exception(");
+      const cleanupEnd = library.indexOf("sycl::device get_dev(", cleanupStart);
+      assert.ok(cleanupStart >= 0 && cleanupEnd > cleanupStart);
+      const removeGuards = /^ *MomSyclHostTransferGuard[^\n]+\n/gm;
+      const routes = [
+        {name: "Wala matrix", file: "walahash/walahash.cpp", owner: "    uint8_t matrix[4096];",
+          start: "    MomSyclHostTransferGuard matrix_transfers(",
+          end: "    std::memcpy(state.matrix_seed, input, 32);", shared: false},
+        {name: "Wala tiled matrix", file: "walahash/walahash.cpp", owner: "    uint8_t matrix[4096];",
+          start: "    MomSyclHostTransferGuard matrix_transfers(",
+          end: "    std::memcpy(state.matrix_seed, input, 32);", shared: false, tiled: true},
+        {name: "Etchash", file: "etchash/state.inc", owner: "    std::vector<uint32_t> host_cache;",
+          start: "    MomSyclHostTransferGuard host_cache_transfers(",
+          end: "    const uint32_t light_nodes", shared: true},
+        {name: "KawPow", file: "kawpow/state.inc", owner: "    std::vector<uint32_t> host_cache;",
+          start: "    MomSyclHostTransferGuard host_cache_transfers(",
+          end: "    const uint32_t light_nodes", shared: true},
+        {name: "FishHash", file: "fishhash/state.inc", owner: "      std::vector<uint64_t> hcache;",
+          start: "      MomSyclHostTransferGuard host_cache_transfers(",
+          end: "      cache_built = true;", shared: true},
+        {name: "Octopus points", file: "octopus/state.inc",
+          owner: "    std::array<uint32_t, POLYNOMIAL_SIZE> host_points;",
+          start: "    MomSyclHostTransferGuard host_points_transfers(",
+          end: "    std::memcpy(points_header.data(), next_header, HASH_LEN);", shared: true},
+        {name: "Octopus cache", file: "octopus/state.inc",
+          owner: "    std::vector<uint32_t> host_cache(static_cast<size_t>(bytes / sizeof(uint32_t)));",
+          start: "    MomSyclHostTransferGuard host_cache_transfers(",
+          end: "    cache_nodes = nodes;", shared: true},
+        {name: "Verthash", file: "verthash/verthash.cpp", owner: "    std::vector<Uint2> host;",
+          start: "    MomSyclHostTransferGuard host_data_transfers(",
+          end: "\n  }\n};", shared: true},
+      ];
+      try {
+        fs.copyFileSync(path.join(__dirname, "native/cache_upload_lifetime.cpp"), source);
+        fs.writeFileSync(path.join(fixture, "cleanup.inc"), library.slice(cleanupStart, cleanupEnd));
+        for (const route of routes) {
+          await t.test(route.name, {concurrency: false}, () => {
+            const entrySource = fs.readFileSync(path.join(root, route.file), "utf8");
+            const owner = entrySource.indexOf(route.owner);
+            const guard = entrySource.indexOf(route.start, owner);
+            assert.ok(owner >= 0 && guard > owner, route.file + ": source owner must precede guard");
+            const end = entrySource.indexOf(route.end, guard);
+            assert.ok(end > guard, route.file + ": upload span end");
+            const entry = entrySource.slice(guard, end);
+            assert.ok(entry.includes("queue.memcpy"), route.name + ": extracted copy");
+            assert.ok(entry.includes("MomSyclHostTransferGuard"), route.name + ": extracted guard");
+            const baseline = entry.replace(removeGuards, "");
+            assert.notEqual(baseline, entry, route.name + ": negative control removed no guard");
+            for (const fixed of [false, true]) {
+              fs.writeFileSync(path.join(fixture, "cache_scope.inc"), fixed ? entry : baseline);
+              const args = ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", "-pedantic",
+                "-DMOM_CACHE_GUARDED=" + (fixed ? 1 : 0),
+                "-DMOM_CACHE_HAS_SHARED=" + (route.shared ? 1 : 0),
+                "-DMOM_CACHE_WALA_TILED=" + (route.tiled ? 1 : 0)];
+              if (route.tiled) {
+                args.push("-DWALAHASH_ESIMD=1");
+              }
+              args.push(source, "-o", executable);
+              const compiled = spawnSync("c++", args, {encoding: "utf8"});
+              assert.equal(compiled.error, undefined);
+              assert.equal(compiled.signal, null);
+              assert.equal(compiled.status, 0, compiled.stderr);
+              const result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+              assert.equal(result.error, undefined);
+              assert.equal(result.signal, null);
+              assert.equal(result.status, fixed ? 0 : 1, result.stdout + result.stderr);
+              if (fixed) {
+                assert.equal(result.stdout, "PASS actual-source cache upload lifetime and exception preservation\n");
+              } else {
+                assert.equal(result.stderr, "FAIL accepted cache upload outlived its local source\n");
+              }
+            }
+          });
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("C29 readback retires copies accepted before a submission throws", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "../sycl");
+      const state = fs.readFileSync(path.join(root, "c29/state.inc"), "utf8");
+      const library = fs.readFileSync(path.join(root, "lib-internal.h"), "utf8");
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-c29-readback-"));
+      try {
+        const source = path.join(fixture, "readback.cpp"), executable = path.join(fixture, "probe");
+        fs.copyFileSync(path.join(__dirname, "native/c29_buffer_readback.cpp"), source);
+        const start = library.indexOf("inline void sycl_log_cleanup_exception(");
+        const end = library.indexOf("sycl::device get_dev(", start);
+        assert.ok(start >= 0 && end > start);
+        fs.writeFileSync(path.join(fixture, "cleanup.inc"), library.slice(start, end));
+        const readback = "template <typename T>\n" + extractCppBlock(state, "static void c29_read_buffer(");
+        const guard = '  MomSyclHostTransferGuard host_transfers(queue, "c29 buffer readback");';
+        assert.ok(readback.includes(guard));
+        for (const fixed of [false, true]) {
+          fs.writeFileSync(path.join(fixture, "readback.inc"), fixed ? readback : readback.replace(guard, ""));
+          const compiled = spawnSync("c++", ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", "-pedantic",
+            source, "-o", executable], {encoding: "utf8"});
+          assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+          const result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+          assert.equal(result.error, undefined);
+          assert.equal(result.status, fixed ? 0 : 1, result.stdout + result.stderr);
+          if (fixed) {
+            assert.equal(result.stdout, "PASS actual-source C29 accepted readback lifetime\n");
+          } else {
+            assert.match(result.stderr, /C29 accepted readback outlived its caller/);
+          }
+        }
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("C29 cleanup joins owned host searches past their result publication", {
+      skip: process.platform === "win32" ? "requires a host C++ compiler" : false,
+    }, () => {
+      const root = path.join(__dirname, "../sycl/c29");
+      const state = fs.readFileSync(path.join(root, "state.inc"), "utf8");
+      const search = fs.readFileSync(path.join(root, "search.inc"), "utf8");
+      const destructor = extractCppBlock(state, "  ~C29State()");
+      assert.ok(destructor.includes("search_futures.clear();"));
+      const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-c29-lifetime-"));
+      try {
+        const source = path.join(fixture, "lifetime.cpp"), executable = path.join(fixture, "probe");
+        fs.copyFileSync(path.join(__dirname, "native/c29_search_lifetime.cpp"), source);
+        fs.writeFileSync(path.join(fixture, "result-state.inc"),
+          extractCppBlock(state, "struct C29QueuedSolution {") + ";\n" +
+          extractCppBlock(state, "struct C29ResultState {") + ";\n");
+        fs.writeFileSync(path.join(fixture, "guard.inc"),
+          extractCppBlock(search, "struct C29SearchCompletionGuard {") + ";\n");
+        const local = search.match(/^\s*C29SearchCompletionGuard active_completion_guard[^\n]+/m);
+        assert.ok(local);
+        fs.writeFileSync(path.join(fixture, "local-guard.inc"), local[0] + "\n");
+        fs.writeFileSync(path.join(fixture, "drain.inc"), "search_futures.clear();\n");
+        const compiled = spawnSync("c++", ["-std=c++17", "-O1", "-Wall", "-Wextra", "-Werror", "-pedantic",
+          "-pthread", "-fsanitize=address", "-fno-omit-frame-pointer",
+          ...(process.platform === "linux" ? ["-fno-pie", "-no-pie"] : []), source, "-o", executable],
+        {encoding: "utf8"});
+        assert.equal(compiled.status, 0, compiled.error?.message || compiled.stderr);
+        const result = spawnSync(executable, [], {encoding: "utf8", timeout: 5000});
+        assert.equal(result.error, undefined);
+        assert.equal(result.signal, null);
+        assert.equal(result.status, 0, result.stdout + result.stderr);
+        assert.equal(result.stdout, "PASS actual-source C29 search lifetime\n");
+      } finally {
+        fs.rmSync(fixture, {recursive: true, force: true});
+      }
+    });
+
+    test("C29 serializes persistent graph access per device", () => {
+      const state = fs.readFileSync(path.join(__dirname, "../sycl/c29/state.inc"), "utf8");
+      const entry = fs.readFileSync(path.join(__dirname, "../sycl/c29/c29.cpp"), "utf8");
+      const stateStart = state.indexOf("struct C29State {");
+      const stateEnd = state.indexOf("};", stateStart);
+      assert.ok(stateStart >= 0 && stateEnd > stateStart);
+      assert.match(state.slice(stateStart, stateEnd), /std::mutex mutex;/);
+      const lock = "C29State& state = c29_state(dev_str);\n    std::lock_guard<std::mutex> state_lock(state.mutex);";
+      assert.ok(entry.includes(lock),
+        "the persistent queue and reusable buffers must be protected before submission or readback");
+    });
+
+    test("Cuckoo transient transfers resolve their device before accepting work", () => {
+      for (const {file, entry} of [
+        {file: "c29/state.inc", entry: "static void c29_read_buffer("},
+        {file: "c29/c29.cpp", entry: "int c29_portable_test("},
+        {file: "c30/c30.cpp", entry: "int c30_portable_test("},
+      ]) {
+        const source = fs.readFileSync(path.join(__dirname, "../sycl", file), "utf8");
+        const body = extractCppBlock(source.slice(source.lastIndexOf(entry)), entry);
+        const query = body.indexOf("const sycl::device device = queue.get_device();");
+        const submit = body.indexOf("queue.submit(");
+        assert.ok(query >= 0 && submit > query, file + ": query faults must precede submission");
+        assert.ok(body.includes("sycl_wait_and_throw(event, device);"), file);
       }
     });
 
@@ -6439,7 +8268,7 @@ int main(int argc, char** argv) {
           end: "#if !defined(MOM_SYCL_PORTABLE_OPENCL)\n  const bool cooperative =",
           uploads: 2, focused: true, shared: true},
         {name: "Nexa monolithic", file: "nexapow/nexapow.cpp", scope: "  state.init_portable();",
-          end: "  sycl_wait_and_throw(state.queue.memset(state.result,", uploads: 3, focused: true},
+          end: "  state.queue.memset(state.result,", uploads: 3, focused: true},
       ];
       const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "mom-host-transfer-fault-"));
       const source = path.join(fixture, "host_transfer_fault.cpp");

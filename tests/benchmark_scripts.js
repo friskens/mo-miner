@@ -18,6 +18,7 @@ test.describe("Correctness test dispatcher", {concurrency: false}, () => {
   const logicFiles = [
     "tests/logic.js", "tests/compiler_policy.js", "tests/portable_dag_modes.js",
     "tests/nvidia_compatibility.js", "tests/intel_device_selection.js", "tests/gpu_test_matrix_order.js",
+    "tests/nvrtc_installer.js",
     "tests/pearlhash_f16_lowering.js", "tests/readme_performance.js",
     "tests/benchmark_scripts.js", "tests/windows_command.js", "tests/pool_transport.js",
     "tests/helper_workers.js", "tests/release_archive.js", "tests/build_release.js", "tests/build_environment.js",

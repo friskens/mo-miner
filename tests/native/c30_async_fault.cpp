@@ -20,6 +20,8 @@
 static int kind, fault_wait, layout, owner;
 static int waits, kernels, copies, cycles, calls, errors, clears, results;
 static int copy_fault, copy_error_kind, cleanup_waits;
+static bool copy_throw_after_enqueue;
+static bool graph_handoff_ok;
 static bool cleanup_error;
 static bool m_has_fn = true;
 static std::string last_error;
@@ -61,9 +63,11 @@ struct queue {
   queue(device, async_handler h, property_list) : handler(std::move(h)) {}
   event memcpy(void* out, const void* in, std::size_t n) {
     ++copies;
-    if (copy_fault == copies)
+    if (copy_fault == copies && !copy_throw_after_enqueue)
       std::rethrow_exception(original_error);
     pending_copies.push_back({out, in, n});
+    if (copy_fault == copies)
+      std::rethrow_exception(original_error);
     return {this};
   }
   template <typename T> event fill(T* out, T value, std::size_t n) {
@@ -116,7 +120,12 @@ static SipKey graph_key(const std::array<std::uint8_t, 32>&, std::uint64_t nonce
   return {nonce, 2, 3, 4};
 }
 static std::optional<std::array<Endpoints, kProofSize>>
-find_cycle(const std::vector<Endpoints>&) {
+find_cycle(const std::vector<Endpoints>& edges) {
+  require(edges.size() == kProofSize, "graph handoff changed endpoint count");
+  for (unsigned i = 0; i != kProofSize; ++i)
+    require(edges[i].u == 100 + i && edges[i].v == 200 + i,
+            "graph handoff changed endpoint values or representation");
+  graph_handoff_ok = true;
   ++cycles;
   return std::array<Endpoints, kProofSize>{};
 }
@@ -185,9 +194,11 @@ static sycl::event trim(sycl::queue& q, T*, std::uint32_t*, unsigned,
 #define c30_trim_sparse_packed trim
 template <typename T>
 static sycl::event compact(sycl::queue& q, T*, std::uint32_t*, unsigned,
-                           sycl::uint2*, std::uint32_t* cursor) {
+                           sycl::uint2* output, std::uint32_t* cursor) {
   ++kernels;
   *cursor = kProofSize;
+  for (unsigned i = 0; i != kProofSize; ++i)
+    output[i] = sycl::uint2{100 + i, 200 + i};
   return {&q};
 }
 #define c30_compact compact
@@ -276,6 +287,7 @@ static void compute_owner(std::uint8_t* output, std::uint32_t* edges) {
 static void run() {
   C30State state;
   active = &state;
+  graph_handoff_ok = false;
   std::uint8_t input[32]{}, output[32];
   std::memset(output, 23, sizeof(output));
   std::uint32_t edges[42];
@@ -312,7 +324,8 @@ static void run() {
             "solver continued submitting kernels/readbacks after failed completion");
     require(cycles == (fault_wait >= 7 ? 1 : 0), "fault advanced CPU cycle search");
   } else {
-    require(output[0] == 42 && edges[41] == 41 && cycles == calls, "successful graph changed");
+    require(output[0] == 42 && edges[41] == 41 && cycles == calls && graph_handoff_ok,
+            "successful graph changed");
   }
   // Only an explicit later job reactivates the owner; reuse is not claimed as real GPU recovery.
   kind = 0;
@@ -353,19 +366,26 @@ static void run_copy_fault() {
   require(sycl::pending_copies.empty(), "copy submission unwound host locals before drain");
   require(cleanup_waits == 1, "copy failure did not retire exactly once before solver destruction");
   require(copies == copy_fault && calls == 1, "copy submission retried another graph or transfer");
-  require(cycles == (copy_fault == 6 ? 1 : 0), "copy failure advanced the cycle search");
+  require(cycles == (copy_fault >= 5 ? 1 : 0), "copy failure advanced the cycle search");
   require(output[0] == 23 && edges[0] == 99 && nonce == 71, "copy failure committed output/nonce");
 }
 int main(int argc, char** argv) {
-  if (argc != 5 && argc != 6)
+  if (argc != 5 && argc != 6 && argc != 7)
     return 2;
-  const bool copy_case = argc == 6 && std::strcmp(argv[1], "copies") == 0;
+  const bool copy_case = argc >= 6 && std::strcmp(argv[1], "copies") == 0;
   if (copy_case) {
+    if (argc != 6 && argc != 7)
+      return 2;
     copy_fault = std::atoi(argv[2]);
     copy_error_kind = std::atoi(argv[3]);
     cleanup_error = std::atoi(argv[4]) != 0;
     layout = std::atoi(argv[5]);
+    if (argc == 7 && std::strcmp(argv[6], "after-enqueue") != 0)
+      return 2;
+    copy_throw_after_enqueue = argc == 7;
   } else {
+    if (argc != 5)
+      return 2;
     kind = std::atoi(argv[1]);
     fault_wait = std::atoi(argv[2]);
     layout = std::atoi(argv[3]);

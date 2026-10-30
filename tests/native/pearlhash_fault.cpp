@@ -9,6 +9,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "claim.h"
+using mom_pearlhash::pearlhash_search_target_le;
 
 enum class Stage {
   success, unavailable, queue, preparation, event_a, event_b, launch, wait, query_a, query_b,
@@ -19,6 +21,10 @@ struct Counters {
   int roots = 0;
   int noise = 0;
   int preparation = 0;
+  int root_dependencies = 0;
+  int preparation_dependencies = 0;
+  int event_wait_a = 0;
+  int event_wait_b = 0;
   int queue_wait = 0;
   int launch = 0;
   int wait = 0;
@@ -34,6 +40,7 @@ static bool string_error;
 static bool cleanup_error;
 static const void* thrown_address;
 static constexpr uint32_t original_seed = 19;
+static uint32_t expected_attempt_seed = original_seed;
 
 static void require(bool condition, const char* message) {
   if (!condition)
@@ -72,9 +79,32 @@ struct command_execution_status {};
 }
 enum class event_command_status {submitted, running, complete};
 }
+struct queue;
+enum class event_kind {generic, roots, a_noise, b_noise, a_preparation, b_preparation};
+struct event {
+  bool first;
+  event_kind kind;
+  const queue* owner;
+  event(bool first_value = false, event_kind kind_value = event_kind::generic,
+        const queue* owner_value = nullptr)
+      : first(first_value), kind(kind_value), owner(owner_value) {}
+  template <typename T>
+  info::event_command_status get_info() {
+    inject(first ? Stage::query_a : Stage::query_b);
+    return info::event_command_status::complete;
+  }
+  void wait_and_throw() {
+    if (first)
+      ++counts.event_wait_a;
+    else
+      ++counts.event_wait_b;
+    inject(first ? Stage::event_a : Stage::event_b);
+  }
+};
 struct device {
   backend selected;
   bool gpu = false;
+  int queue_id = 0;
   backend get_backend() const { return selected; }
   bool is_cpu() const { return false; }
   bool is_gpu() const { return gpu; }
@@ -112,17 +142,22 @@ struct queue {
     inject(Stage::queue);
   }
 };
-struct event {
-  bool first;
-  template <typename T>
-  info::event_command_status get_info() {
-    inject(first ? Stage::query_a : Stage::query_b);
-    return info::event_command_status::complete;
-  }
-  void wait_and_throw() {
-    inject(first ? Stage::event_a : Stage::event_b);
-  }
-};
+}
+static bool mom_is_hip(const sycl::device& device) {
+  return device.selected == sycl::backend::hip;
+}
+
+// Model the shared helper's GPU query/completion boundary; its polling/unwind policy has its own
+// actual-source tests. This fixture keeps device.is_gpu() false outside this dispatch boundary.
+static void sycl_wait_and_throw(sycl::event event, const sycl::device& device) {
+  require(event.owner && event.owner->get_device().queue_id == device.queue_id &&
+              ((event.first && (event.kind == sycl::event_kind::a_noise ||
+                                event.kind == sycl::event_kind::a_preparation)) ||
+               (!event.first && (event.kind == sycl::event_kind::b_noise ||
+                                 event.kind == sycl::event_kind::b_preparation))),
+          "HIP A/B completion event was waited on the wrong queue or stream side");
+  (void)event.get_info<sycl::info::event::command_execution_status>();
+  event.wait_and_throw();
 }
 
 struct Result {
@@ -141,23 +176,31 @@ struct Buffers {
   uint8_t* CVB = nullptr;
   uint8_t* cA = nullptr;
   uint8_t* cB = nullptr;
+  int proof_rows = 16, proof_cols = 16;
+  bool positive_inputs = false;
+  bool seed_prefix_inputs = false;
+  bool fixed_b_reuse = false;
+  uint32_t fixed_b_seed = 0;
 };
 using CV = std::array<uint8_t, 32>;
 struct Proof {
   uint32_t seed;
-  int row, col, m, n, k, rank;
+  uint32_t b_seed;
+  int row, col, m, n, k, rank, proof_rows, proof_cols;
   uint8_t key[32], jackpot[32];
   std::vector<CV> leaves_a, leaves_b;
+  bool pair_dist8 = false;
+  bool positive_inputs = false;
   bool claim_ready = true;
   bool valid = true;
 } g_pf;
 
 struct PearlHashHipSearch {
-  bool ensure(sycl::queue& q, int, int, int, int) {
+  bool ensure(sycl::queue& q, const Buffers&, int, int, int, int) {
     return q.get_device().selected == sycl::backend::hip && failure_stage != Stage::unavailable;
   }
   void launch(const Buffers&, uint32_t seed, int, int, int, int, bool) {
-    require(seed == original_seed, "launch changed the attempt seed");
+    require(seed == expected_attempt_seed, "launch changed the attempt seed");
     ++counts.launch;
     inject(Stage::launch);
   }
@@ -172,7 +215,7 @@ struct PearlHashCudaSearch {
     return failure_stage != Stage::unavailable;
   }
   void launch(const Buffers&, uint32_t seed, int, int, int, bool) {
-    require(seed == original_seed, "launch changed the attempt seed");
+    require(seed == expected_attempt_seed, "launch changed the attempt seed");
     ++counts.launch;
     inject(Stage::launch);
   }
@@ -182,29 +225,57 @@ struct PearlHashCudaSearch {
   }
   void fail(const std::string&) { ++counts.fail; }
 };
-struct PearlHashPrepEvents {
+struct PearlHashEventPair {
   sycl::event a{true};
   sycl::event b{false};
 };
 
-static void k_roots(sycl::queue&, const Buffers&, uint32_t seed, int, int, int) {
-  require(seed == original_seed, "roots changed the attempt seed");
+static sycl::event k_roots(sycl::queue& q, const Buffers&, uint32_t seed, int, int, int) {
+  require(seed == expected_attempt_seed, "roots changed the attempt seed");
   ++counts.roots;
   inject(Stage::roots);
+  return sycl::event{true, sycl::event_kind::roots, &q};
 }
-static void k_noise(sycl::queue&, const Buffers&, int, int, int, int) {
+static PearlHashEventPair k_noise(sycl::queue& a, sycl::queue& b, const Buffers&, int, int,
+                                  int, int, const sycl::event& roots) {
+  require(roots.kind == sycl::event_kind::roots && roots.owner == &a,
+          "noise lost the commitment-root dependency");
+  ++counts.root_dependencies;
+  if (a.selected.selected != sycl::backend::hip)
+    require(&a == &b, "non-HIP noise escaped the main queue");
+  else
+    require(&a != &b, "HIP A/B noise producers must use distinct queues");
   ++counts.noise;
   inject(Stage::noise);
+  return {sycl::event{true, sycl::event_kind::a_noise, &a},
+          sycl::event{false, sycl::event_kind::b_noise, &b}};
 }
-static void compute_ab(sycl::queue&, const Buffers&, uint32_t seed, int, int, int, int, bool) {
-  require(seed == original_seed, "preparation changed the attempt seed");
+static void fixture_compute_ab(sycl::queue&, const Buffers&, uint32_t seed, int, int, int, int,
+                               bool) {
+  require(seed == expected_attempt_seed, "preparation changed the attempt seed");
   ++counts.preparation;
   inject(Stage::preparation);
 }
-static PearlHashPrepEvents compute_ab_amd_wmma(
-    sycl::queue& q, sycl::queue&, const Buffers& b, uint32_t seed, int m, int n, int k, int rank) {
-  compute_ab(q, b, seed, m, n, k, rank, true);
+template <bool Dpasw = false, bool PackedCuda = false>
+static sycl::event compute_ab(sycl::queue& q, const Buffers& b, uint32_t seed, int m, int n, int k,
+                              int rank, bool portable, bool force_b_pack = false) {
+  (void)Dpasw;
+  (void)PackedCuda;
+  (void)force_b_pack;
+  fixture_compute_ab(q, b, seed, m, n, k, rank, portable);
   return {};
+}
+static PearlHashEventPair compute_ab_amd_wmma(
+    sycl::queue& q, sycl::queue& prep, const Buffers& b, uint32_t seed, int m, int n, int k,
+    int rank, const sycl::event& a_noise, const sycl::event& b_noise) {
+  require(&q != &prep && a_noise.kind == sycl::event_kind::a_noise &&
+              a_noise.owner == &q && b_noise.kind == sycl::event_kind::b_noise &&
+              b_noise.owner == &prep,
+          "HIP preparation lost split noise queue/event ownership");
+  ++counts.preparation_dependencies;
+  fixture_compute_ab(q, b, seed, m, n, k, rank, true);
+  return {sycl::event{true, sycl::event_kind::a_preparation, &q},
+          sycl::event{false, sycl::event_kind::b_preparation, &prep}};
 }
 static void compute_ab_cpu(const Buffers&, uint32_t, int, int, int, int) {
 }
@@ -217,8 +288,9 @@ static size_t checked_elements(int n, int k, const char*) {
 static size_t checked_chunk_count(size_t bytes, const char*) {
   return bytes / 1024 + (bytes % 1024 != 0);
 }
-static void search(sycl::queue&, const Buffers&, uint32_t seed, int, int, int, int, bool) {
-  require(seed == original_seed, "fallback changed the attempt seed");
+static void search(sycl::queue&, const Buffers&, uint32_t seed, int, int, int, int, bool,
+                   bool = false) {
+  require(seed == expected_attempt_seed, "fallback changed the attempt seed");
   ++counts.fallback;
 }
 static void search_cpu(
@@ -242,13 +314,20 @@ struct State {
   uint8_t key[32]{};
   uint8_t header[76]{};
   bool have_header = false;
+  bool header_pair_dist8 = false;
+  bool fixed_b_valid = false;
+  uint32_t fixed_b_seed = 0;
 };
 
-static void derive_key(const uint8_t*, int, int, uint8_t* key) {
+static void derive_key(const uint8_t*, int, int, uint8_t* key, int, int) {
   ++counts.derived_keys;
   std::memset(key, 7, 32);
 }
-static void prepare_roots_cpu(const Buffers& b, uint32_t, int, int, int) {
+static void derive_key_pair_dist8(const uint8_t* header, int k, int rank, uint8_t* key) {
+  derive_key(header, k, rank, key, 16, 16);
+}
+static void prepare_roots_cpu(const Buffers& b, uint32_t, int, int, int,
+                              const uint32_t* = nullptr) {
   std::memset(b.cA, 3, 32);
   std::memset(b.cB, 4, 32);
 }
@@ -261,11 +340,16 @@ template <typename Fn> static void sycl_cleanup_noexcept(const char*, Fn&& fn) n
 
 static int run_copies(sycl::queue& q, State& st, Buffers& b, uint64_t* pseed, bool is_test) {
 #include "invalidate.inc"
+#include "state-invalidation.inc"
+  constexpr bool pair_dist8 = false;
   constexpr int m = 2048, n = 2048, k = 2048, rank = 128;
+  constexpr bool hip_jit = false;
   constexpr unsigned job_ref = 1, cert_version = 3;
   const std::string backend = "native";
   const uint8_t input[76] = {1};
   uint8_t target[32];
+  const uint8_t* const base_target = nullptr;
+  bool reuse_fixed_b = false;
   for (unsigned i = 0; i < 32; ++i)
     target[i] = static_cast<uint8_t>(i);
 #include "upload.inc"
@@ -287,6 +371,8 @@ static int check_copies(bool readback) {
   q.target_address = target.data();
   q.root_a_address = root_a.data();
   st.have_header = true;
+  st.fixed_b_valid = true;
+  st.fixed_b_seed = 0xfeed1234u;
   uint64_t seed = original_seed;
   bool caught = false;
   bool same_exception = false;
@@ -303,6 +389,7 @@ static int check_copies(bool readback) {
   const bool fault = failure_stage != Stage::success;
   require(caught == fault, "queued-copy fault was swallowed or healthy path failed");
   require(q.pending.empty(), "queued copy outlived its stack owner");
+  require(!st.fixed_b_valid, "entry invalidation retained a stale fixed-B snapshot");
   if (counts.retired_copies >= 2) {
     for (unsigned i = 0; i < 32; ++i) {
       require(key[i] == 7 && target[i] == (readback ? 255 : 31 - i),
@@ -319,7 +406,8 @@ static int check_copies(bool readback) {
     const bool uploaded = failure_stage == Stage::readback_a || failure_stage == Stage::readback_b;
     require(st.have_header == uploaded, "failed new-header upload was cached as ready");
     const bool waited = uploaded || failure_stage == Stage::queue || failure_stage == Stage::wait;
-    require(counts.queue_wait == 1 + (waited ? 1 : 0), "fault was not drained exactly once");
+    require(counts.queue_wait == 1 + (waited ? 1 : 0) + (uploaded ? 0 : 1),
+            "fault cleanup did not retire the owning queues");
     if (!uploaded) {
       if (failure_stage != Stage::wait)
         require(counts.launch == 0 && counts.wait == 0, "upload fault reached native search");
@@ -346,16 +434,128 @@ static int check_copies(bool readback) {
 
 static int run(bool dispatch, bool hip, sycl::queue& q, Buffers& b, uint64_t* pseed) {
 #include "invalidate.inc"
+  constexpr bool pair_dist8 = false;
   State st{{}, {}, {q.get_device(), {}}};
+#include "state-invalidation.inc"
+  bool reuse_fixed_b = pair_dist8 && prior_fixed_b_valid;
+  q.selected.queue_id = 1;
+  st.prep_queue.selected.queue_id = 2;
   const uint32_t attempt_seed = static_cast<uint32_t>(*pseed);
   constexpr int m = 2048, n = 2048, k = 2048, rank = 128;
   constexpr bool is_test = false;
   PearlHashSearchBackend search_backend = dispatch
-      ? attempt(q, b, attempt_seed, m, n, k, rank, "native", hip ? &st.hip : nullptr,
+      ? attempt(q, b, attempt_seed, m, n, k, rank, "native", &st.hip,
                 hip ? nullptr : &st.cuda, &st.prep_queue)
       : hip ? PearlHashSearchBackend::hip_jit : PearlHashSearchBackend::cuda_jit;
 #include "wait.inc"
+#include "commit-fixed-b.inc"
 #include "commit.inc"
+}
+
+struct PairObservation {
+  bool reuse;
+  uint32_t producer_b_seed;
+  uint32_t committed_b_seed;
+  bool cache_valid;
+  uint32_t attempt_seed;
+};
+
+// This is deliberately assembled from the production state/header/seed/dispatch/commit blocks
+// by compiler_policy.js. It is a state-transition fixture, not an independent fixed-B model.
+static PairObservation run_pair_attempt(sycl::queue& q, State& st, Buffers& b, uint64_t* pseed,
+                                        bool pair_dist8, const uint8_t* input) {
+#include "invalidate.inc"
+#include "state-invalidation.inc"
+  constexpr int m = 2048, n = 2048, k = 8192, rank = 128;
+  const std::string backend = "native";
+  b.positive_inputs = true;
+  q.key_address = b.key;
+#include "pair-header.inc"
+  const uint32_t attempt_seed = static_cast<uint32_t>(*pseed);
+  expected_attempt_seed = attempt_seed;
+#include "fixed-b-seed.inc"
+  PearlHashSearchBackend search_backend;
+  try {
+    search_backend = attempt(q, b, attempt_seed, m, n, k, rank, backend, &st.hip, &st.cuda,
+                              nullptr, false, true, false, pair_dist8, reuse_fixed_b);
+#include "wait.inc"
+  }
+#include "pair-catch.inc"
+#include "commit-fixed-b.inc"
+  b.result->found = 0; // Exercise the actual no-winner commit path used by a completed attempt.
+  commit_fixed_b();
+  return {b.fixed_b_reuse, b.fixed_b_seed, st.fixed_b_seed, st.fixed_b_valid, attempt_seed};
+}
+
+static int check_pair_lifecycle() {
+  sycl::queue q{{sycl::backend::ext_oneapi_cuda, true}, {}};
+  State st{{}, {}, {q.get_device(), {}}};
+  Result result;
+  result.found = 0;
+  std::array<uint8_t, 32> key{}, target{};
+  Buffers b{&result, key.data(), target.data()};
+  uint8_t first_header[76] = {1};
+  uint8_t changed_header[76] = {2};
+  failure_stage = Stage::success;
+  string_error = false;
+  cleanup_error = false;
+  thrown_address = nullptr;
+
+  uint64_t first_seed = original_seed;
+  const PairObservation first = run_pair_attempt(q, st, b, &first_seed, true, first_header);
+  require(!first.reuse && first.producer_b_seed == original_seed && first.cache_valid,
+          "first pair attempt did not commit its B seed");
+  require(first.committed_b_seed == original_seed && first.attempt_seed == original_seed,
+          "first pair commit changed the producer seed");
+
+  uint64_t second_seed = original_seed + 1;
+  const PairObservation second = run_pair_attempt(q, st, b, &second_seed, true, first_header);
+  require(second.reuse && second.producer_b_seed == original_seed && second.cache_valid,
+          "same-header pair attempt did not reuse the committed B seed");
+  require(second.attempt_seed != first.attempt_seed,
+          "same-header pair lifecycle did not advance the A attempt seed");
+  require(second.committed_b_seed == original_seed,
+          "pair cache hit replaced the committed B seed");
+
+  // A header changes the keyed B roots/noise and must force a fresh B miss. This catches reuse
+  // based only on the newly copied header rather than the header that was cached with fixed B.
+  uint64_t changed_seed = original_seed + 2;
+  const PairObservation changed =
+      run_pair_attempt(q, st, b, &changed_seed, true, changed_header);
+  require(!changed.reuse && changed.producer_b_seed == changed_seed && changed.cache_valid,
+          "header change reused fixed B from the previous header");
+
+  // Switching away from the pair route invalidates the retained pair state; returning to pair
+  // mode must be a miss even when the header bytes are unchanged.
+  uint64_t ordinary_seed = original_seed + 3;
+  const PairObservation ordinary =
+      run_pair_attempt(q, st, b, &ordinary_seed, false, changed_header);
+  require(!ordinary.reuse && !ordinary.cache_valid,
+          "ordinary route retained pair fixed-B state");
+  uint64_t returned_seed = original_seed + 4;
+  const PairObservation returned =
+      run_pair_attempt(q, st, b, &returned_seed, true, changed_header);
+  require(!returned.reuse && returned.producer_b_seed == returned_seed && returned.cache_valid,
+          "pair route after ordinary mode did not rebuild B");
+
+  // A producer fault is before the commit block and must leave the cache invalid. The production
+  // catch block is included above, so queued ownership is checked in the same fixture.
+  failure_stage = Stage::preparation;
+  uint64_t failed_seed = original_seed + 5;
+  bool caught = false;
+  try {
+    (void)run_pair_attempt(q, st, b, &failed_seed, true, changed_header);
+  } catch (const std::exception&) {
+    caught = true;
+  } catch (const std::string&) {
+    caught = true;
+  }
+  require(caught && !st.fixed_b_valid && q.pending.empty(),
+          "pair producer fault published or retained fixed B");
+  failure_stage = Stage::success;
+  expected_attempt_seed = original_seed;
+  std::puts("PASS actual-source Pearl pair fixed-B lifecycle");
+  return 0;
 }
 
 // Exercise the real native winner-capture block with deferred copies, including failed readbacks.
@@ -404,6 +604,30 @@ static int check_native_capture(bool hip) {
   return 0;
 }
 
+// A selected pair key cannot fall through to the ordinary contiguous search if
+// a later admission check declines. Exercise the actual dispatch, not a model.
+static int check_pair_decline() {
+#include "invalidate.inc"
+  sycl::queue q{{sycl::backend::ext_oneapi_cuda}, {}};
+  Result result;
+  Buffers b{&result};
+  PearlHashCudaSearch cuda;
+  failure_stage = Stage::unavailable;
+  bool caught = false;
+  try {
+    (void)attempt(q, b, original_seed, 2048, 2048, 8192, 128, "native",
+                  nullptr, &cuda, nullptr, false, false, false, true, false);
+  } catch (const std::string& error) {
+    caught = error == "PearlHash pair-dist8 CUDA route became unavailable after admission";
+  }
+  require(caught && counts.fallback == 0 && counts.launch == 0 && counts.fail == 0,
+          "admitted pair route silently changed its proof pattern or retried");
+  require(!g_pf.valid && !g_pf.claim_ready && g_pf.leaves_a.empty() && g_pf.leaves_b.empty(),
+          "declined pair route exposed a stale claim");
+  std::puts("PASS actual-source Pearl pair decline fails closed");
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc != 5)
     return 2;
@@ -411,6 +635,22 @@ int main(int argc, char** argv) {
   const bool hip = std::atoi(argv[2]) != 0;
   failure_stage = static_cast<Stage>(std::atoi(argv[3]));
   string_error = std::atoi(argv[4]) != 0;
+  if (std::string(argv[1]) == "pair-lifecycle") {
+    try {
+      return check_pair_lifecycle();
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "%s\n", error.what());
+      return 1;
+    }
+  }
+  if (std::string(argv[1]) == "pair") {
+    try {
+      return check_pair_decline();
+    } catch (const std::exception& error) {
+      std::fprintf(stderr, "%s\n", error.what());
+      return 1;
+    }
+  }
   if (std::string(argv[1]) == "capture") {
     string_error = std::atoi(argv[4]) % 2 != 0;
     cleanup_error = std::atoi(argv[4]) >= 2;
@@ -480,6 +720,43 @@ int main(int argc, char** argv) {
     }
     require(counts.roots == (dispatch ? 1 : 0), "attempt was resubmitted");
     require(counts.noise == (dispatch ? 1 : 0), "noise preparation was repeated");
+    if (dispatch && hip) {
+      if (failure_stage != Stage::roots) {
+        require(counts.root_dependencies == 1,
+                "HIP noise did not retain the commitment-root dependency");
+        require(counts.noise == 1, "HIP split noise was not submitted exactly once");
+      }
+      if (failure_stage != Stage::roots && failure_stage != Stage::noise &&
+          failure_stage != Stage::unavailable)
+        require(counts.preparation_dependencies == 1,
+                "HIP preparation did not retain both noise event dependencies");
+
+      int expected_a = -1, expected_b = -1;
+      switch (failure_stage) {
+      case Stage::success:
+      case Stage::unavailable:
+      case Stage::event_b:
+      case Stage::launch:
+      case Stage::wait:
+        expected_a = expected_b = 1;
+        break;
+      case Stage::event_a:
+      case Stage::query_b:
+        expected_a = 1;
+        expected_b = 0;
+        break;
+      case Stage::query_a:
+      case Stage::preparation:
+        expected_a = expected_b = 0;
+        break;
+      default:
+        break;
+      }
+      if (expected_a >= 0) {
+        require(counts.event_wait_a == expected_a && counts.event_wait_b == expected_b,
+                "HIP A/B completion events were not retired independently");
+      }
+    }
     std::puts("PASS actual-source Pearl native fault boundary");
     return 0;
   } catch (const std::exception& error) {

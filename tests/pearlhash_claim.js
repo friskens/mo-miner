@@ -316,6 +316,25 @@ test.describe("PearlHash claim verification", {concurrency: false}, () => {
     assert.match(dispatch, /#if defined\(PEARLHASH_ESIMD\)\s*if \(use_dpasw\)\s*\{\s*search_esimd_dpasw/u);
   });
 
+  test("PearlHash wide ESIMD specializes common K values and retains other profiles", () => {
+    const source = fs.readFileSync(path.join(__dirname, "../sycl/pearlhash/esimd_search.inc"), "utf8");
+    const branch = source.match(
+      /if \(pearlhash_wide_pipeline_route\(width, rank, n\)\) \{([\s\S]*?)\n {4}\}/u
+    )?.[1];
+    assert.ok(branch, "Missing capability/shape-gated ESIMD dispatch");
+    // Execute the production dispatch without requiring an Intel compiler or GPU.
+    const body = branch.replace(
+      /search_esimd_impl<16, 128, 4(?:, (\d+))?>\([^;]+\);/gu,
+      (_, fixedK) => `return ${fixedK || 0};`
+    );
+    assert.doesNotMatch(body, /search_esimd_impl/u);
+    const select = vm.runInNewContext(`k => { ${body} }`, {},
+      {timeout: 1000, contextCodeGeneration: {strings: false, wasm: false}});
+    for (const [k, expected] of [[2048, 2048], [4096, 4096], [128, 0], [4160, 0], [8192, 0]]) {
+      assert.equal(select(k), expected, `ESIMD specialization for K=${k}`);
+    }
+  });
+
   const verifierPath = process.env["MOM_NODE_POWHASH_PATH"];
   const device = process.env["MOM_PEARLHASH_CLAIM_DEVICE"];
   const skip = !verifierPath || !device

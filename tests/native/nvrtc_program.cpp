@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <array>
+#include <string_view>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +36,7 @@ using nvrtcProgram = void*;
 using nvrtcResult = int;
 using CUresult = int;
 using CUdevice = int;
+using CUdevice_attribute = int;
 using CUmodule = void*;
 using CUfunction = void*;
 using CUevent = void*;
@@ -45,8 +48,13 @@ constexpr int CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 2;
 constexpr int CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES = 3;
 constexpr int CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT = 4;
 constexpr int CU_EVENT_DEFAULT = 0;
+constexpr int CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 5;
+constexpr int CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN = 6;
+constexpr int CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK = 7;
+constexpr int CU_DEVICE_ATTRIBUTE_WARP_SIZE = 8;
 static int variant;
 static int fault;
+static std::string compiled_architecture;
 static int handles[8];
 static bool program_live = false;
 struct Counts {
@@ -79,8 +87,11 @@ static nvrtcResult create_program(nvrtcProgram* output, const char*, const char*
   program_live = true;
   return fault == 3 ? 1 : NVRTC_SUCCESS;
 }
-static nvrtcResult compile_program(nvrtcProgram program, int, const char* const*) {
+static nvrtcResult compile_program(nvrtcProgram program, int count, const char* const* options) {
   ++counts.compile;
+  for (int i = 0; i < count; ++i)
+    if (std::string(options[i]).find("--gpu-architecture=") == 0)
+      compiled_architecture = options[i];
   return !program || fault == 4 || fault == 5 || fault == 6 || fault == 9
       ? 1 : NVRTC_SUCCESS;
 }
@@ -104,14 +115,14 @@ static nvrtcResult get_code_size(nvrtcProgram, std::size_t* size) {
   ++counts.code_size;
   if (fault == 7)
     return 1;
-  *size = 4096;
+  *size = fault == 25 ? 0 : fault == 26 ? 128 * 1024 * 1024 + 1 : 4096;
   if (fault == 10)
     fail_allocation = true;
   return NVRTC_SUCCESS;
 }
 static nvrtcResult get_code(nvrtcProgram, char* output) {
   ++counts.code;
-  if (fault == 8)
+  if (fault == 8 || fault == 25 || fault == 26)
     return 1;
   std::memset(output, 0, 4096);
   return NVRTC_SUCCESS;
@@ -173,6 +184,7 @@ public:
     return 0;
   };
   int (*set_current)(void*) = +[](void*) { return 0; };
+  int (*synchronize)() = +[]() { return 0; };
   int (*release_primary)(int) = +[](int) {
     if (program_live)
       ++counts.release_with_program;
@@ -218,15 +230,18 @@ public:
   decltype(&::destroy_program) destroy_program = ::destroy_program;
   decltype(&::error_string) error_string = ::error_string;
   std::string error = "NVRTC unavailable";
+  int (*version)(int*, int*) = +[](int* major, int* minor) {
+    *major = 13; *minor = 3; return NVRTC_SUCCESS;
+  };
   bool ptx_available() const { return fault != 1; }
-  bool cubin_available() const { return fault != 1; }
+  bool cubin_available() const { return fault != 1 && variant != 5; }
   int (*get_num_supported_archs)(int*) = +[](int* count) {
-    *count = 1;
-    return 0;
+    *count = fault == 22 ? 0 : fault == 23 ? 129 : 1;
+    return fault == 21 ? 1 : 0;
   };
   int (*get_supported_archs)(int*) = +[](int* archs) {
-    *archs = variant == 3 ? 80 : 120;
-    return 0;
+    *archs = variant == 3 || variant == 4 ? 80 : 120;
+    return fault == 24 ? 1 : 0;
   };
   static NvrtcApi& instance() {
     static NvrtcApi api;
@@ -234,11 +249,11 @@ public:
   }
 };
 namespace jit_cache {
-std::uint64_t hash(const std::string&) { return 1; }
+std::uint64_t hash(std::string_view) { return 1; }
 std::filesystem::path directory() {
   return fault == 15 ? std::filesystem::path("fixture-cache") : std::filesystem::path{};
 }
-std::vector<char> read(const std::filesystem::path&) { return {0}; }
+std::vector<char> read(const std::filesystem::path&, size_t = size_t(-1)) { return {0}; }
 void write(const std::filesystem::path&, const std::vector<char>&) {}
 }
 }
@@ -252,23 +267,47 @@ static std::filesystem::path pearlhash_cuda_header_root(
     const char*, const std::vector<std::filesystem::path>&, const std::filesystem::path&) {
   return "fixture-headers";
 }
+alignas(16) static unsigned char fixture_ap[32];
+alignas(16) static unsigned char fixture_bp[32];
 struct Buffers {
+  void* Ap = fixture_ap;
+  void* Bp = fixture_bp;
+  void* EAL = fixture_ap;
+  void* EBRt = fixture_bp;
   void* transcript = &handles[5];
   int transcript_rows = 128;
 };
+// Keep legacy source-JIT lifetime separate from actual compact admission tests.
+namespace compact_private {
+static bool selected(int, int, int, int) { return false; }
+}
 #include "pearl.inc"
 
 static void check(bool valid, const char* message) {
   if (!valid)
     throw std::runtime_error(message);
 }
+static void check_candidate_shape() {
+  check(PearlHashCudaSearch::supports_shape(131072, 524288, 8192, 128),
+        "rank-128 full shape was rejected");
+  check(PearlHashCudaSearch::supports_shape(128, 256, 4096, 256),
+        "rank-256 tile shape was rejected");
+  check(!PearlHashCudaSearch::supports_shape(127, 256, 8192, 128),
+        "unaligned M shape was admitted");
+  check(!PearlHashCudaSearch::supports_shape(128, 255, 8192, 128),
+        "unaligned N shape was admitted");
+  check(!PearlHashCudaSearch::supports_shape(128, 256, 4096, 128),
+        "rank/K mismatch was admitted");
+}
 int main(int argc, char** argv) {
   try {
     check(argc == 3, "expected variant and case");
     variant = std::atoi(argv[1]);
     fault = std::atoi(argv[2]);
-    check(variant >= 1 && variant <= 3, "invalid variant");
-    check(fault >= 0 && fault <= 16, "invalid case");
+    check_candidate_shape();
+    check(variant >= 1 && variant <= 5, "invalid variant");
+    check(fault >= 0 && fault <= 26, "invalid case");
+    const bool cn_variant = variant == 1 || variant == 4 || variant == 5;
 #if defined(MOM_FIXTURE_HAS_OWNER)
     static_assert(!std::is_copy_constructible_v<mom::NvrtcProgram>);
     static_assert(!std::is_copy_assignable_v<mom::NvrtcProgram>);
@@ -302,15 +341,32 @@ int main(int argc, char** argv) {
     bool result = false;
     std::string reason;
     sycl::queue queue;
-    if (variant == 1) {
+    if (cn_variant) {
       CnGpuCudaExpand value;
       result = value.ensure(queue, &reason);
     } else {
       PearlHashCudaSearch value;
       Buffers buffers;
+      if (fault == 17)
+        buffers.Ap = nullptr;
+      else if (fault == 18)
+        buffers.Bp = nullptr;
+      else if (fault == 19)
+        buffers.Ap = fixture_ap + 1;
+      else if (fault == 20)
+        buffers.Bp = fixture_bp + 1;
       result = value.ensure(queue, buffers, 128, 256, 8192, 128);
+      if (fault == 0) {
+        value.release();
+        value.release();
+        check(!value.enabled && !value.checked && !value.module && !value.context &&
+                  !value.started && !value.done && !value.packed,
+              "release did not clear candidate state");
+      }
     }
-    const bool creates = fault != 1 && fault != 11 && fault != 15 && fault != 16;
+    const bool invalid_packed_buffers = !cn_variant && fault >= 17 && fault <= 20;
+    const bool creates = fault != 1 && fault != 11 && fault != 15 && fault != 16 &&
+        !(fault >= 21 && fault <= 24) && !invalid_packed_buffers;
     const bool owns = creates && fault != 2 && fault != 12;
     check(counts.creates == (creates ? 1u : 0u), "create count changed");
     check(counts.destroys == (owns ? 1u : 0u), "temporary program not destroyed once");
@@ -326,11 +382,16 @@ int main(int argc, char** argv) {
     if (fault >= 4 && fault <= 8)
       check(failure_calls[fault - 4] == 1, "fault injection stage was not reached");
     if (counts.code_size)
-      check((variant == 2 ? counts.cubin_size : counts.ptx_size) == counts.code_size,
+      check((variant == 1 || variant == 2 ? counts.cubin_size : counts.ptx_size) == counts.code_size,
             "PTX/CUBIN size selection changed");
     if (counts.code)
-      check((variant == 2 ? counts.cubin : counts.ptx) == counts.code,
+      check((variant == 1 || variant == 2 ? counts.cubin : counts.ptx) == counts.code,
             "PTX/CUBIN retrieval selection changed");
+    if (cn_variant && counts.compile)
+      check(compiled_architecture == (variant == 1 ? "--gpu-architecture=sm_120" :
+             "--gpu-architecture=compute_80"), "CN native/forward compiler target changed");
+    if (fault == 25 || fault == 26)
+      check(counts.code_size == 1 && counts.code == 0, "invalid output size reached retrieval");
     std::puts("PASS actual-source NVRTC lifetime");
     return 0;
   } catch (const std::exception& error) {

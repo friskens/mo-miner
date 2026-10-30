@@ -59,7 +59,7 @@ test.describe("NVIDIA compatibility", {concurrency: false}, () => {
       "cuEventQuery", "cuEventElapsedTime", "cuGetErrorString"];
     const rtcSymbols = ["nvrtcCreateProgram", "nvrtcCompileProgram", "nvrtcGetProgramLogSize",
       "nvrtcGetProgramLog", "nvrtcGetPTXSize", "nvrtcGetPTX", "nvrtcGetCUBINSize", "nvrtcGetCUBIN",
-      "nvrtcGetNumSupportedArchs", "nvrtcGetSupportedArchs", "nvrtcDestroyProgram"];
+      "nvrtcGetNumSupportedArchs", "nvrtcGetSupportedArchs", "nvrtcDestroyProgram", "nvrtcVersion"];
     // Stub declarations/loader prevent real CUDA libraries or device access. The code under test
     // remains the actual production headers, including their dynamic-driver control flow.
     const headers = {

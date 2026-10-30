@@ -44,7 +44,7 @@ test.describe("Pearl FP16 deferred JIT lowering", () => {
     assert.ok(call > text.indexOf("pearlhash_wmma_m16n16k16_f16("));
     assert.match(text.slice(Math.max(0, call - 700), call), /sycl::group_barrier\(it\.get_sub_group\(\), sycl::memory_scope::sub_group\)/);
     assert.match(text.slice(call, call + 700), /sycl::group_barrier\(it\.get_sub_group\(\), sycl::memory_scope::sub_group\)/);
-    assert.match(text, /static_assert\(!FP16Matrix \|\| \(Native && ER \* EC == 8\)/);
+    assert.match(text, /static_assert\(!FP16Matrix \|\| \(Native && ER \* EC == 8 && Rows == 16 && Cols == 16\)/);
   });
   test("Actual reflection predicate fails closed and selects only known SM70–74 PTX60+", {
     skip: available ? false : "LLVM21 clang/llc unavailable",

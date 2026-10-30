@@ -122,6 +122,8 @@ static hiprtcResult destroy_program(hiprtcProgram* program) {
 static const char* error_string(hiprtcResult) { return "fake compiler error"; }
 static hipError_t hipSetDevice(hipDevice_t) { return hipSuccess; }
 static hipError_t hipGetDeviceProperties(hipDeviceProp_t* properties, hipDevice_t) {
+  if (fault == 15)
+    return 1;
   if (fault == 11)
     std::strcpy(properties->gcnArchName, "gfx1100");
   return hipSuccess;
@@ -143,12 +145,7 @@ static hipError_t hipEventCreate(hipEvent_t* event) {
   return hipSuccess;
 }
 static hipError_t hipEventDestroy(hipEvent_t) { return hipSuccess; }
-static hipError_t hipFree(void*) { return hipSuccess; }
 static hipError_t hipModuleUnload(hipModule_t) { return hipSuccess; }
-static hipError_t hipMalloc(void** memory, std::size_t) {
-  *memory = &handles[4];
-  return hipSuccess;
-}
 namespace sycl {
 struct device {};
 struct queue { device get_device() const { return {}; } };
@@ -159,6 +156,8 @@ namespace amd {
 bool has_gfx12_int8_wmma(const char* arch) { return std::strncmp(arch, "gfx12", 5) == 0; }
 }
 void hip_queue_identity(sycl::queue&, hipDevice_t& device, hipStream_t& stream) {
+  if (fault == 16)
+    throw std::runtime_error("fake HIP interop");
   device = 0;
   stream = &handles[5];
 }
@@ -191,9 +190,16 @@ void write(const std::filesystem::path&, const std::vector<char>&) {}
 }
 }
 
+#include "capability.inc"
 #include "owner.inc"
 #include "octopus.inc"
 #include "walahash.inc"
+struct Buffers {
+  void* Ap = &handles[2];
+  void* Bp = &handles[3];
+  uint32_t* transcript = reinterpret_cast<uint32_t*>(&handles[4]);
+  int transcript_rows = 256;
+};
 #include "pearl.inc"
 
 static void check(bool valid, const char* message) {
@@ -206,7 +212,29 @@ int main(int argc, char** argv) {
     const int algorithm = std::atoi(argv[1]);
     fault = std::atoi(argv[2]);
     check(algorithm >= 1 && algorithm <= 3, "invalid algorithm");
-    check(fault >= 0 && fault <= 14, "invalid case");
+    check(fault >= 0 && fault <= 16, "invalid case");
+    if (fault == 15) {
+      sycl::queue queue;
+      std::string reason;
+      check(!mom::hip_gfx12_int8_wmma_supported(queue, &reason),
+            "HIP capability property failure was accepted");
+      check(reason == "hipGetDeviceProperties: fake HIP error",
+            "HIP capability property failure lost its reason");
+      std::puts("PASS capability property failure");
+      return 0;
+    }
+    if (fault == 16) {
+      try {
+        sycl::queue queue;
+        (void)mom::hip_gfx12_int8_wmma_supported(queue);
+        check(false, "HIP capability interop failure was swallowed");
+      } catch (const std::runtime_error& error) {
+        check(std::string(error.what()) == "fake HIP interop",
+              "HIP capability interop failure changed");
+        std::puts("PASS capability interop propagation");
+        return 0;
+      }
+    }
 #if defined(MOM_FIXTURE_HAS_OWNER)
     static_assert(!std::is_copy_constructible_v<mom::HiprtcProgram>);
     static_assert(!std::is_copy_assignable_v<mom::HiprtcProgram>);
@@ -249,7 +277,7 @@ int main(int argc, char** argv) {
         result = value.ensure(queue);
       } else {
         PearlHashHipSearch value;
-        result = value.ensure(queue, 256, 256, 2048, 128);
+        result = value.ensure(queue, Buffers{}, 256, 256, 2048, 128);
       }
     } catch (const std::bad_alloc&) {
       allocation = true;

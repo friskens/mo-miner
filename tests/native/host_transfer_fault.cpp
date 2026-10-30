@@ -165,6 +165,7 @@ static void dispatch(State& state, const uint8_t* input, const uint8_t* target) 
   [[maybe_unused]] uint8_t* const d_inputs = state.input;
   [[maybe_unused]] const size_t input_bytes = 40;
   [[maybe_unused]] const unsigned input_size = 40;
+  [[maybe_unused]] constexpr unsigned extra_bytes = 8;
   [[maybe_unused]] constexpr bool is_test = false;
   (void) target;
 #if MOM_HOST_TRANSFER_WITH_GUARD

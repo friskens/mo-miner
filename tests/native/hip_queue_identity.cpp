@@ -25,6 +25,7 @@ struct Counters {
   int gemm = 0;
   int finish = 0;
   int completion = 0;
+  int drains = 0;
 } counts;
 
 static Stage failure_stage;
@@ -33,6 +34,7 @@ static const void* thrown_address;
 static bool reached_return;
 static bool checked_at_destroy;
 static int device_at_destroy = -1;
+static bool cleanup_fault;
 static constexpr int selected_device = 7;
 
 static void require(bool condition, const char* message) {
@@ -143,7 +145,11 @@ struct queue {
   }
   context get_context() const { return {}; }
   device get_device() const { return {hip}; }
-  void wait_and_throw() {}
+  void wait_and_throw() {
+    ++counts.drains;
+    if (cleanup_fault)
+      throw std::runtime_error("secondary slot cleanup failure");
+  }
 };
 template <typename T>
 T* malloc_device(size_t, queue&) {
@@ -224,6 +230,36 @@ static sycl::event native_finish(sycl::queue&, const uint8_t*, const uint32_t*, 
 
 #include "octopus.inc"
 
+// Keep the search owner alive after the fault: destruction alone must not hide pending slot work.
+static void retry_after_fault(sycl::queue& queue, bool fail_cleanup) {
+  OctopusSyclNativeSearch search;
+  uint8_t header[32]{};
+  uint32_t points[1024]{};
+  Result result;
+  cleanup_fault = fail_cleanup;
+  bool caught = false, same_exception = false;
+  try {
+    search.search(queue, header, nullptr, {}, points, 42, 5, 130, nullptr, &result, false);
+  } catch (const std::string& error) {
+    caught = true;
+    same_exception = error_kind == 1 && &error == thrown_address;
+  } catch (const std::exception& error) {
+    caught = true;
+    same_exception = error_kind == 0 && &error == thrown_address;
+  } catch (const int& error) {
+    caught = true;
+    same_exception = error_kind == 2 && &error == thrown_address;
+  }
+  require(caught && same_exception, "slot cleanup replaced the original search failure");
+  require(counts.drains == 3, "native search returned with undrained slot queues");
+  require(counts.allocations == 5, "fixture did not fail after pipeline allocation");
+  cleanup_fault = false;
+  failure_stage = Stage::success;
+  require(search.search(queue, header, nullptr, {}, points, 42, 5, 130, nullptr, &result, false),
+          "native search could not retry after retirement");
+  require(counts.allocations == 10, "retry reused the faulted pipeline allocations");
+}
+
 int main(int argc, char** argv) {
   if (argc != 4)
     return 2;
@@ -239,6 +275,11 @@ int main(int argc, char** argv) {
   bool same_exception = false;
   bool status_exception = false;
   try {
+    if (target == 3 || target == 4) {
+      retry_after_fault(queue, target == 4);
+      std::puts("PASS actual-source HIP interop/Octopus fault boundary");
+      return 0;
+    }
     if (target < 2) {
       if (target == 0)
         mom::hip_queue_identity(queue, device, stream);

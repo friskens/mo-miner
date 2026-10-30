@@ -49,7 +49,7 @@ void test_pearlhash_capacity() {
   const pearlhash_profile_t compact = {65536, 65536, 4096, 256};
   const pearlhash_profile_t ordinary = {131072, 131072, 2048, 128};
   constexpr uint64_t reserve = 512 * kMiB;
-  PearlHashAllocationCounts wide_counts{}, compact_counts{}, ordinary_counts{}, hip_counts{};
+  PearlHashAllocationCounts wide_counts{}, compact_counts{}, ordinary_counts{};
   expect_true("Pearl wide legal", pearlhash_allocation_counts(wide, wide_counts));
   expect_equal("Pearl wide Bp spans full uint32 byte domain", wide_counts.n_k, 4 * kGiB);
   expect_equal("Pearl wide Ap", wide_counts.m_k, kGiB);
@@ -64,11 +64,6 @@ void test_pearlhash_capacity() {
   expect_equal("Pearl compact complete required budget", compact_counts.total_bytes, 620822848ULL);
   expect_true("Pearl ordinary legal", pearlhash_allocation_counts(ordinary, ordinary_counts));
   expect_equal("Pearl ordinary complete required budget", ordinary_counts.total_bytes, 620790080ULL);
-  expect_true("Pearl HIP duplicate layout legal",
-               pearlhash_allocation_counts(ordinary, hip_counts, true));
-  expect_equal("Pearl HIP unchanged maximum", hip_counts.max_alloc, ordinary_counts.max_alloc);
-  expect_equal("Pearl HIP duplicate matrix bytes",
-                hip_counts.total_bytes - ordinary_counts.total_bytes, 512 * kMiB);
 
   constexpr uint64_t transcript = 1 * kGiB;
   expect_true("Pearl optional transcript exact capacity",
@@ -139,6 +134,45 @@ void test_pearlhash_capacity() {
   expect_true("Pearl zero shape rejected", !pearlhash_allocation_counts({}, ordinary_counts));
 }
 
+void test_pearlhash_amd_native_profile() {
+  const pearlhash_profile_t ordinary = {131072, 131072, 2048, 128};
+  const pearlhash_profile_t candidate = {262144, 262144, 2048, 128};
+  const pearlhash_profile_t native = {524288, 524288, 2048, 128};
+  PearlHashAllocationCounts candidate_counts{}, native_counts{};
+  expect_true("Pearl AMD candidate shape legal",
+              mom::job_boundary::valid_pearlhash_shape(
+                  candidate.m, candidate.n, candidate.k, candidate.rank));
+  expect_true("Pearl AMD native shape legal",
+              mom::job_boundary::valid_pearlhash_shape(
+                  native.m, native.n, native.k, native.rank));
+  expect_true("Pearl AMD candidate allocation counts",
+              pearlhash_allocation_counts(candidate, candidate_counts));
+  expect_true("Pearl AMD native allocation counts",
+              pearlhash_allocation_counts(native, native_counts));
+  const uint64_t exact_global = candidate_counts.total_bytes + pearlhash_runtime_reserve_bytes;
+  const uint64_t exact_alloc = candidate_counts.max_alloc;
+  const uint64_t native_global = native_counts.total_bytes + pearlhash_runtime_reserve_bytes;
+  const uint64_t native_alloc = native_counts.max_alloc;
+
+  expect_pearl_profile("Pearl AMD native candidate exact fit",
+      pearlhash_amd_native_profile_for({80, native_global, native_alloc}, true), native);
+  expect_pearl_profile("Pearl AMD native global boundary selects next candidate",
+      pearlhash_amd_native_profile_for({80, native_global - 1, native_alloc}, true), candidate);
+  expect_pearl_profile("Pearl AMD native allocation boundary selects next candidate",
+      pearlhash_amd_native_profile_for({80, native_global, native_alloc - 1}, true), candidate);
+  expect_pearl_profile("Pearl AMD candidate exact fit",
+      pearlhash_amd_native_profile_for({80, exact_global, exact_alloc}, true),
+      candidate);
+  expect_pearl_profile("Pearl AMD candidate global boundary",
+      pearlhash_amd_native_profile_for({80, exact_global - 1, exact_alloc}, true), ordinary);
+  expect_pearl_profile("Pearl AMD candidate allocation boundary",
+      pearlhash_amd_native_profile_for({80, exact_global, exact_alloc - 1}, true), ordinary);
+  expect_pearl_profile("Pearl AMD unadmitted route fallback",
+      pearlhash_amd_native_profile_for({80, 16 * kGiB, 8 * kGiB}, false), ordinary);
+  expect_pearl_profile("Pearl AMD unknown capacity fallback",
+      pearlhash_amd_native_profile_for({80, 0, 0}, true), ordinary);
+}
+
 void test_pearlhash_intel_capability_profile() {
   const pearlhash_profile_t ordinary = {131072, 131072, 2048, 128};
   const pearlhash_profile_t wide = {131072, 131072, 4096, 128};
@@ -172,6 +206,70 @@ void test_pearlhash_intel_capability_profile() {
           std::numeric_limits<unsigned>::max()), {524288, 131072, 2048, 128});
   expect_pearl_profile("Pearl Intel wide profile does not inherit narrow scaling",
       pearlhash_intel_capability_profile(16, true, true, eight_gib, 512), wide);
+}
+
+// Exercise the real policy across hardware sizes and exact allocation limits;
+// no SDK or GPU is required to catch signed overflow or lost fallback paths.
+void test_pearlhash_nvidia_compact_profile() {
+  constexpr pearlhash_profile_t fast = {27648,32768,65536,128};
+  constexpr pearlhash_profile_t large = {32256,15360,65536,128};
+  constexpr pearlhash_profile_t small = {16128,15360,65536,128};
+  const PowDeviceProfile roomy = {36,16*kGiB,8*kGiB};
+  expect_pearl_profile("Pearl native larger preferred",
+      pearlhash_nvidia_compact_profile_for(roomy,true),fast);
+  for (unsigned units = 1; units <= 512; ++units) {
+    const PowDeviceProfile d = {units,16*kGiB,8*kGiB};
+    const auto p = pearlhash_nvidia_compact_profile_for(d,true);
+    const uint64_t quantum = uint64_t(192)*units/std::gcd(units,60u);
+    const uint64_t minimum = (16000+quantum-1)/quantum*quantum;
+    const uint64_t bound = uint64_t(std::numeric_limits<int32_t>::max())/65536;
+    if (minimum > bound) {
+      expect_equal("Pearl impossible complete wave",p.m,0);
+    } else {
+      expect_pearl_profile("Pearl measured or largest complete wave",p, units == 36 ? fast :
+          pearlhash_profile_t{unsigned(bound/quantum*quantum),15360,65536,128});
+      expect_equal("Pearl complete native CTA rows",p.m%192,0);
+      expect_equal("Pearl complete native CTA columns",p.n%256,0);
+      expect_equal("Pearl no partial SM wave",(uint64_t(p.m)/192*(p.n/256))%units,0);
+      expect_true("Pearl signed M*K",uint64_t(p.m)*p.k<=uint64_t(INT32_MAX));
+      expect_true("Pearl disjoint raw streams",(uint64_t(p.m)+p.n)*p.k<=(uint64_t(1)<<32));
+      expect_true("Pearl whole allocation admission",pearlhash_required_memory_fits(d,p));
+    }
+    expect_equal("Pearl no native admission",pearlhash_nvidia_compact_profile_for(d,false).m,0);
+  }
+  for (unsigned units : {0u,65535u,26843546u,std::numeric_limits<unsigned>::max()})
+    expect_equal("Pearl unknown/extreme CU decline",
+        pearlhash_nvidia_compact_profile_for({units,16*kGiB,8*kGiB},true).m,0);
+  PearlHashAllocationCounts fast_counts{},big{},little{};
+  expect_true("Pearl fast required counts",pearlhash_allocation_counts(fast,fast_counts));
+  expect_equal("Pearl fast memory budget",fast_counts.total_bytes,4219863360ULL);
+  expect_equal("Pearl fast largest allocation",fast_counts.max_alloc,2*kGiB);
+  expect_pearl_profile("Pearl fast exact memory",
+      pearlhash_nvidia_compact_profile_for(
+          {36,fast_counts.total_bytes+pearlhash_runtime_reserve_bytes,fast_counts.max_alloc},true),fast);
+  expect_pearl_profile("Pearl fast total-memory fallback",
+      pearlhash_nvidia_compact_profile_for(
+          {36,fast_counts.total_bytes+pearlhash_runtime_reserve_bytes-1,fast_counts.max_alloc},true),large);
+  expect_pearl_profile("Pearl fast max-allocation fallback",
+      pearlhash_nvidia_compact_profile_for({36,16*kGiB,fast_counts.max_alloc-1},true),large);
+  expect_true("Pearl larger required counts",pearlhash_allocation_counts(large,big));
+  expect_true("Pearl smaller required counts",pearlhash_allocation_counts(small,little));
+  expect_pearl_profile("Pearl larger exact memory",
+      pearlhash_nvidia_compact_profile_for(
+          {36,big.total_bytes+pearlhash_runtime_reserve_bytes,big.max_alloc},true),large);
+  expect_pearl_profile("Pearl total-memory fallback",
+      pearlhash_nvidia_compact_profile_for(
+          {36,big.total_bytes+pearlhash_runtime_reserve_bytes-1,big.max_alloc},true),small);
+  expect_pearl_profile("Pearl max-allocation fallback",
+      pearlhash_nvidia_compact_profile_for({36,16*kGiB,big.max_alloc-1},true),small);
+  expect_pearl_profile("Pearl smaller exact memory",
+      pearlhash_nvidia_compact_profile_for(
+          {36,little.total_bytes+pearlhash_runtime_reserve_bytes,little.max_alloc},true),small);
+  for (const auto d : {PowDeviceProfile{36,little.total_bytes+pearlhash_runtime_reserve_bytes-1,little.max_alloc},
+       {36,16*kGiB,little.max_alloc-1},{36,0,8*kGiB},{36,16*kGiB,0},
+       {36,pearlhash_runtime_reserve_bytes-1,8*kGiB}})
+    expect_equal("Pearl insufficient/unknown capacity",
+        pearlhash_nvidia_compact_profile_for(d,true).m,0);
 }
 
 } // namespace
@@ -244,6 +342,8 @@ int main() {
   const unsigned before_pearl = assertions;
   test_pearlhash_intel_capability_profile();
   test_pearlhash_capacity();
+  test_pearlhash_amd_native_profile();
+  test_pearlhash_nvidia_compact_profile();
   std::printf("Pearl capacity host test passed (%u assertions)\n", assertions - before_pearl);
   std::printf("Pow intensity host test passed (%u assertions total)\n", assertions);
   return 0;

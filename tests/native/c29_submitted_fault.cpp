@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -19,6 +21,9 @@ static int mode, proof_size, owner;
 static int calls, seeds, trims, waits, copies, thread_attempts, threads, errors, clears;
 static const void* original_exception;
 static bool m_has_fn = true;
+static bool recovery_ready;
+static unsigned recovery_reads;
+static unsigned graph_copies;
 static std::string last_error;
 static void require(bool ok, const char* message) {
   if (!ok)
@@ -68,7 +73,10 @@ template <typename T, int D> accessor(buffer<T, D>&, handler&, int) -> accessor<
 template <typename T, int D> accessor(buffer<T, D>&, handler&, int, int) -> accessor<T, D>;
 template <typename T, int D> struct host_accessor {
   buffer<T, D>& value;
-  host_accessor(buffer<T, D>& b, int) : value(b) {}
+  host_accessor(buffer<T, D>& b, int) : value(b) {
+    require(recovery_ready, "recovery readback bypassed the low-CPU completion boundary");
+    ++recovery_reads;
+  }
   T* get_pointer() const { return value.data.data(); }
 };
 template <typename T, int D> host_accessor(buffer<T, D>&, int) -> host_accessor<T, D>;
@@ -96,6 +104,11 @@ struct queue {
 };
 template <typename T> T min(T a, T b) { return std::min(a, b); }
 }
+struct GraphEdges : std::vector<sycl::uint2> {
+  using std::vector<sycl::uint2>::vector;
+  GraphEdges(const GraphEdges& other) : std::vector<sycl::uint2>(other) { ++graph_copies; }
+  GraphEdges(GraphEdges&&) = default;
+};
 static void inject() {
   try {
     throw sycl::exception("C29 submitted graph fault");
@@ -105,7 +118,7 @@ static void inject() {
   }
 }
 sycl::device sycl::queue::get_device() const {
-  if (mode == 1)
+  if (mode == 1 || mode == 10)
     inject();
   return {};
 }
@@ -126,9 +139,12 @@ struct C29Profile {
 #include "cycle.inc"
 #include "job-boundary.inc"
 struct C29State {
+  sycl::device device;
   sycl::queue queue;
   C29Buffers buffers;
   std::shared_ptr<C29ResultState> result_state = std::make_shared<C29ResultState>();
+  std::vector<std::future<void>> search_futures;
+  std::mutex mutex;
 };
 static C29State* active;
 static C29State& c29_state(const std::string& dev) {
@@ -147,8 +163,10 @@ struct Atomic {
 template <typename A> static Atomic c29_global_atomic(const A&, size_t) { return {}; }
 static void sycl_wait_and_throw(sycl::event, sycl::device) {
   ++waits;
-  if (mode == 4)
+  if (mode == 4 || mode == 9)
     inject();
+  if (mode == 8 || mode == 10)
+    recovery_ready = true;
 }
 static void c29_read_buffer(sycl::queue&, sycl::buffer<uint32_t, 1>&, uint32_t* out, unsigned) {
   ++copies;
@@ -166,27 +184,33 @@ static void c29_read_buffer(sycl::queue&, sycl::buffer<sycl::uint2, 1>&,
     out[i * 2 + 1] = {(i + 1) % (n / 2), i};
   }
 }
-// Deterministic host-thread boundary; the actual moved completion guard and cycle body are retained.
+// Deterministic host-task boundary; the actual moved completion guard and cycle body are retained.
 struct Task { virtual ~Task() = default; virtual void run() = 0; };
-template <typename F> struct TypedTask : Task {
-  F fn;
-  explicit TypedTask(F&& f) : fn(std::move(f)) {}
-  void run() override { fn(); }
-};
 static std::vector<std::unique_ptr<Task>> tasks;
-struct TestThread {
-  std::unique_ptr<Task> task;
-  template <typename F> explicit TestThread(F&& f)
-      : task(std::make_unique<TypedTask<F>>(std::move(f))) {
-    ++thread_attempts;
-    if (mode == 7)
-      throw std::runtime_error("thread unavailable");
-  }
-  void detach() {
-    ++threads;
-    tasks.push_back(std::move(task));
+template <typename F> struct AsyncTask : Task {
+  F fn;
+  std::promise<void> promise;
+  explicit AsyncTask(F&& value) : fn(std::move(value)) {}
+  std::future<void> get_future() { return promise.get_future(); }
+  void run() override {
+    try {
+      fn();
+      promise.set_value();
+    } catch (...) {
+      promise.set_exception(std::current_exception());
+    }
   }
 };
+template <typename F> static std::future<void> TestAsync(std::launch, F&& fn) {
+  ++thread_attempts;
+  if (mode == 7)
+    throw std::runtime_error("thread unavailable");
+  auto task = std::make_unique<AsyncTask<F>>(std::move(fn));
+  std::future<void> result = task->get_future();
+  ++threads;
+  tasks.push_back(std::move(task));
+  return result;
+}
 #include "search.inc"
 static int call(unsigned job, unsigned proof, const uint8_t* input, unsigned n, uint8_t* output,
                  uint32_t* edges, uint64_t* nonce, const std::string& dev) {
@@ -262,6 +286,7 @@ static void run() {
   require(nonce == 71 && output[0] == 23, "failed/pending graph committed nonce/output");
   require(thread_attempts == (fault ? 0 : calls), "fault started a CPU cycle thread");
   require(threads == (mode == 7 || fault ? 0 : calls), "thread-start boundary changed");
+  require(graph_copies == 0, "cycle thread copied the retired graph");
   for (auto& task : tasks)
     task->run();
   tasks.clear();
@@ -275,6 +300,35 @@ static void run() {
       require(word == 0x1f1f1f1f1f1f1f1fULL, "valid graph seed changed");
   }
 }
+static void run_recovery() {
+  C29State state;
+  active = &state;
+  state.result_state->active_job_ref = 9;
+  C29QueuedSolution solution{};
+  solution.job_ref = 9;
+  solution.nonce = 72;
+  solution.edges.resize(proof_size);
+  state.result_state->solutions.push_back(std::move(solution));
+  uint8_t output[32];
+  std::memset(output, 23, sizeof(output));
+  uint32_t edges[42];
+  std::fill_n(edges, 42, 73u);
+  uint64_t nonce = 71;
+  bool caught = false;
+  try {
+    require(c29(9, proof_size, input, sizeof(input), output, edges, &nonce, "fixture") == 1,
+            "completed recovery did not return a proof");
+  } catch (const sycl::exception& error) {
+    caught = true;
+    require(&error == original_exception, "recovery exception identity changed");
+  }
+  require(caught == (mode == 9), "recovery fault was swallowed");
+  const bool success = mode != 9;
+  require(waits == 1 && recovery_reads == (success ? 1u : 0u),
+          "recovery did not retire before readback");
+  require(nonce == (success ? 72u : 71u) && output[0] == (success ? 31 : 23) &&
+          edges[0] == (success ? 0u : 73u), "recovery committed partial output");
+}
 int main(int argc, char** argv) {
   if (argc != 4)
     return 2;
@@ -283,7 +337,10 @@ int main(int argc, char** argv) {
   owner = std::atoi(argv[3]);
   unsetenv("MOM_C29_TEST_EDGE");
   try {
-    run();
+    if (mode >= 8)
+      run_recovery();
+    else
+      run();
     std::puts("PASS actual-source C29 submitted fault boundary");
     return 0;
   } catch (const std::exception& error) {
