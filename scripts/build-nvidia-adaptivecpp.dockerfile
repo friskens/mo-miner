@@ -8,6 +8,7 @@ ARG ADAPTIVECPP_COMMIT=da2463e45aa90aa36306c45abcfc05b87de51bc6
 ARG MOM_BUILD_JOBS=6
 COPY scripts/install-dev.sh /tmp/mom-install-dev/install-dev.sh
 COPY scripts/install-cutlass.sh /tmp/mom-install-dev/install-cutlass.sh
+COPY scripts/install-nvrtc-current.sh /tmp/mom-install-dev/install-nvrtc-current.sh
 COPY scripts/patches/adaptivecpp-cuda-unloading.patch /tmp/mom-install-dev/patches/adaptivecpp-cuda-unloading.patch
 RUN MOM_ADAPTIVECPP_COMMIT="$ADAPTIVECPP_COMMIT" \
       bash /tmp/mom-install-dev/install-dev.sh --component acpp-cuda --jobs "$MOM_BUILD_JOBS"

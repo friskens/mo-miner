@@ -13,10 +13,12 @@ FROM mom-build-nvidia-adaptivecpp:latest AS acpp_cuda
 FROM combined AS compiler-runtime
 SHELL ["/bin/bash", "-c"]
 COPY scripts/install-cutlass.sh /tmp/mom-install-dev/install-cutlass.sh
+COPY scripts/install-nvrtc-current.sh /tmp/mom-install-dev/install-nvrtc-current.sh
 # The combined image supplies CUDA/NVRTC. CUTLASS is a small header-only source-JIT dependency and
 # belongs in the final developer image even when its much larger compiler parent is reused from an
 # older BuildKit cache.
-RUN bash -euc '. /tmp/mom-install-dev/install-cutlass.sh; install_cutlass_headers'
+RUN bash -euc '. /tmp/mom-install-dev/install-cutlass.sh; install_cutlass_headers; \
+    . /tmp/mom-install-dev/install-nvrtc-current.sh; install_nvrtc_current'
 COPY scripts/install-dev.sh /tmp/mom-install-dev/install-dev.sh
 RUN MOM_ROCM_VERSION=7.1.1 bash /tmp/mom-install-dev/install-dev.sh --component rocm && \
     rm -rf /var/lib/apt/lists/*

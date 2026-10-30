@@ -27,6 +27,10 @@ if [ -f "$SCRIPT_DIR/install-cutlass.sh" ]; then
   # shellcheck disable=SC1091
   . "$SCRIPT_DIR/install-cutlass.sh"
 fi
+if [ -f "$SCRIPT_DIR/install-nvrtc-current.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/install-nvrtc-current.sh"
+fi
 
 if [ ! -r /etc/os-release ]; then
   echo "/etc/os-release is missing; unable to detect the Linux distribution." >&2
@@ -153,7 +157,7 @@ install_cuda_toolkit_payload_from_apt() {
   # collide with NVIDIA Docker's bind-mounted driver files, but the payload is
   # enough for the SYCL source-JIT.
   local dest deb library nvrtc_builtins nvrtc_library nvrtc_builtins_library staging previous=""
-  local -a packages=(nvidia-cuda-toolkit nvidia-cuda-dev libnvrtc12 libcu++-dev)
+  local -a packages=(nvidia-cuda-toolkit nvidia-cuda-dev libcu++-dev)
   if [[ -e /usr/local/cuda || -L /usr/local/cuda ]]; then
     if [[ -x /usr/local/cuda/bin/ptxas &&
       -r /usr/local/cuda/include/cuda.h &&
@@ -162,8 +166,10 @@ install_cuda_toolkit_payload_from_apt() {
       ( -r /usr/local/cuda/include/cuda/std/cstdint ||
         -r /usr/local/cuda/include/cccl/cuda/std/cstdint ) &&
       -r /usr/local/cuda/nvvm/libdevice/libdevice.10.bc ]] &&
-      runtime_has_library /usr/local/cuda/lib64 libnvrtc.so &&
-      runtime_has_library /usr/local/cuda/lib64 libnvrtc-builtins.so; then
+      { { runtime_has_library /usr/local/cuda/lib64 libnvrtc.so &&
+          runtime_has_library /usr/local/cuda/lib64 libnvrtc-builtins.so; } ||
+        { declare -F install_nvrtc_current >/dev/null &&
+          install_nvrtc_current /opt/mom/nvrtc-13.3.33 --validate-only; }; }; then
       echo "  Keeping the complete CUDA source-JIT toolkit at /usr/local/cuda."
       return 0
     fi
@@ -171,9 +177,14 @@ install_cuda_toolkit_payload_from_apt() {
     return 1
   fi
   echo "  Installing the NVIDIA source-JIT toolchain from Ubuntu apt packages..."
-  nvrtc_builtins="$(apt-cache search --names-only '^libnvrtc-builtins[0-9.]+' 2>/dev/null |
-    awk 'NR == 1 { print $1 }')"
-  [ -z "$nvrtc_builtins" ] || packages+=("$nvrtc_builtins")
+  # Old standalone installers retain their old compiler path. Bundled installers
+  # already provisioned the shared compiler and must not download another NVRTC.
+  if ! declare -F install_nvrtc_current >/dev/null; then
+    packages+=(libnvrtc12)
+    nvrtc_builtins="$(apt-cache search --names-only '^libnvrtc-builtins[0-9.]+' 2>/dev/null |
+      awk 'NR == 1 { print $1 }')"
+    [ -z "$nvrtc_builtins" ] || packages+=("$nvrtc_builtins")
+  fi
   dest="/opt/nvidia-cuda-ubuntu"
   staging="$(mktemp -d /opt/nvidia-cuda-ubuntu.staging.XXXXXX)"
   chmod 755 "$staging"
@@ -192,8 +203,18 @@ install_cuda_toolkit_payload_from_apt() {
     dpkg-deb -x "$deb" "$staging"
     rm -f -- "$deb"
   done
-  nvrtc_library="$(find "$staging/usr/lib" -type f -name 'libnvrtc.so*' -print -quit 2>/dev/null || true)"
-  nvrtc_builtins_library="$(find "$staging/usr/lib" -type f -name 'libnvrtc-builtins.so*' -print -quit 2>/dev/null || true)"
+  if declare -F install_nvrtc_current >/dev/null; then
+    nvrtc_library=/opt/mom/nvrtc-13.3.33/lib/libnvrtc.so.13.3.33
+    nvrtc_builtins_library=/opt/mom/nvrtc-13.3.33/lib/libnvrtc-builtins.so.13.3.33
+    # This tree is our unpublished mktemp extraction, never an existing user's SDK.
+    # Drop any development-package NVRTC aliases/payloads before publishing it.
+    find "$staging/usr/lib" -maxdepth 2 \( -type f -o -type l \) \
+      \( -name 'libnvrtc.so*' -o -name 'libnvrtc-builtins.so*' \) -delete
+    ln -sfn /opt/mom/nvrtc-13.3.33/include/nvrtc.h "$staging/usr/include/nvrtc.h"
+  else
+    nvrtc_library="$(find "$staging/usr/lib" -type f -name 'libnvrtc.so*' -print -quit 2>/dev/null || true)"
+    nvrtc_builtins_library="$(find "$staging/usr/lib" -type f -name 'libnvrtc-builtins.so*' -print -quit 2>/dev/null || true)"
+  fi
   if ! [[ -x "$staging/usr/bin/ptxas" &&
     -d "$staging/usr/include" &&
     -r "$staging/usr/include/cuda.h" &&
@@ -202,7 +223,8 @@ install_cuda_toolkit_payload_from_apt() {
     ( -r "$staging/usr/include/cuda/std/cstdint" ||
       -r "$staging/usr/include/cccl/cuda/std/cstdint" ) &&
     -r "$staging/usr/lib/nvidia-cuda-toolkit/libdevice/libdevice.10.bc" &&
-    -n "$nvrtc_library" && -n "$nvrtc_builtins_library" ]]; then
+    -n "$nvrtc_library" && -r "$nvrtc_library" &&
+    -n "$nvrtc_builtins_library" && -r "$nvrtc_builtins_library" ]]; then
     echo "CUDA staged payload is missing ptxas, headers, libdevice, or NVRTC" >&2
     exit 1
   fi
@@ -227,7 +249,9 @@ install_cuda_toolkit_payload_from_apt() {
   ln -sfn "$dest/usr/include" /usr/local/cuda/include
   ln -sfn "$dest/usr/lib/nvidia-cuda-toolkit/libdevice" /usr/local/cuda/nvvm/libdevice
   for library in "$dest"/usr/lib/x86_64-linux-gnu/libnvrtc.so* \
-                 "$dest"/usr/lib/x86_64-linux-gnu/libnvrtc-builtins.so*; do
+                 "$dest"/usr/lib/x86_64-linux-gnu/libnvrtc-builtins.so* \
+                 /opt/mom/nvrtc-13.3.33/lib/libnvrtc.so* \
+                 /opt/mom/nvrtc-13.3.33/lib/libnvrtc-builtins.so*; do
     [ -e "$library" ] || continue
     ln -sf "$library" "/usr/local/cuda/lib64/${library##*/}"
   done
@@ -268,7 +292,12 @@ if [ "$has_nvidia" = 1 ]; then
     [ "$reboot_needed" = 1 ] || echo "  WARNING: could not install an NVIDIA driver via apt -- install one manually (e.g. 'sudo ubuntu-drivers install')." >&2
   fi
   # Full-speed ProgPoW and PearlHash need the source compiler, CUDA/CCCL headers, and CUTLASS.
-  apt-get install -y --no-install-recommends ca-certificates curl g++
+  apt-get install -y --no-install-recommends ca-certificates curl g++ xz-utils
+  if declare -F install_nvrtc_current >/dev/null; then
+    install_nvrtc_current
+  else
+    echo "  Using legacy NVRTC; use the bundled installer for current NVIDIA acceleration."
+  fi
   install_cuda_toolkit_payload_from_apt
   if ! declare -F install_cutlass_headers >/dev/null; then
     cutlass_helper="$(mktemp)"

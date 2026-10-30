@@ -243,6 +243,11 @@ install_oneapi() {
 install_cuda() {
   # shellcheck disable=SC1091
   . "$SCRIPT_DIR/install-cutlass.sh"
+  # The same qualified compiler serves Pearl and CN/GPU; do not install a second
+  # older NVRTC runtime just to obtain its development header.
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/install-nvrtc-current.sh"
+  install_nvrtc_current
   local cuda_dir="/usr/local/cuda-${CUDA_VERSION/-/.}"
   if ! cuda_payload_ready "$cuda_dir"; then
     # NVIDIA does not always publish a repository for a brand-new Ubuntu release immediately. The
@@ -257,7 +262,10 @@ install_cuda() {
     # Keep the compiler SDK narrow. cuda-toolkit also pulls profilers, GUI tools, BLAS/FFT/solver
     # libraries, and OpenCL components; mom needs only NVCC/PTXAS/libdevice, CUDA/CCCL headers,
     # cudart development stubs, and NVRTC for architecture-aware source JIT.
-    apt_install "cuda-minimal-build-${CUDA_VERSION}" "cuda-nvrtc-dev-${CUDA_VERSION}"
+    apt_install "cuda-minimal-build-${CUDA_VERSION}"
+  fi
+  if [[ ! -e $cuda_dir/include/nvrtc.h && ! -L $cuda_dir/include/nvrtc.h ]]; then
+    ln -s /opt/mom/nvrtc-13.3.33/include/nvrtc.h "$cuda_dir/include/nvrtc.h"
   fi
   cuda_payload_ready "$cuda_dir" || {
     echo "CUDA SDK payload is missing: $cuda_dir" >&2
@@ -494,7 +502,10 @@ validate_component() {
       /opt/intel/oneapi/compiler/latest/bin/icpx --version 2>/dev/null | grep -q '2026\.0\.0' ;;
     cuda)
       local cuda_dir="/usr/local/cuda-${CUDA_VERSION/-/.}"
+      # shellcheck disable=SC1091
+      . "$SCRIPT_DIR/install-nvrtc-current.sh"
       cuda_payload_ready "$cuda_dir" &&
+        install_nvrtc_current /opt/mom/nvrtc-13.3.33 --validate-only &&
         [[ -r /opt/mom/cutlass/include/cute/tensor.hpp ]] &&
         link_points_to /usr/local/cuda "$cuda_dir"
       ;;

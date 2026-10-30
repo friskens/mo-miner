@@ -11,7 +11,7 @@ FROM ubuntu:24.04
 
 SHELL ["/bin/bash", "-c"]
 
-COPY scripts/install-dev.sh scripts/install-cutlass.sh /tmp/mom-install-dev/
+COPY scripts/install-dev.sh scripts/install-cutlass.sh scripts/install-nvrtc-current.sh /tmp/mom-install-dev/
 
 # Install common tooling and every prebuilt compiler dependency in one canonical pass. Expensive
 # source-built AdaptiveCpp stages remain independently cached by the multicompiler image.

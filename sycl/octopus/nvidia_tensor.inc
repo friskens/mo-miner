@@ -911,7 +911,7 @@ public:
   bool search(sycl::queue& base, const uint8_t* const header, const uint32_t* const dag,
               const FastModData page_mod, const uint32_t* const points,
               const uint64_t points_version, const uint64_t start, const uint32_t count,
-              const uint8_t* const target, Result* const result, const bool is_test) {
+              const uint8_t* const target, Result* const result, const bool is_test) try {
     if (!ensure(base)) {
       release();
       return false;
@@ -980,5 +980,10 @@ public:
     }
 #endif
     return true;
+  } catch (...) {
+    // Slot queues are not tracked by base. Retire every producer before another job can reuse
+    // the header/result or pipeline buffers, preserving the original failure even if cleanup fails.
+    release();
+    throw;
   }
 };

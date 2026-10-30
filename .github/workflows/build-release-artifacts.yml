@@ -112,11 +112,13 @@ jobs:
             input2: scripts/patches/adaptivecpp-cuda-unloading.patch
             input3: scripts/install-dev.sh
             input4: scripts/install-cutlass.sh
+            input5: scripts/install-nvrtc-current.sh
           - scope: acpp-hip
             input1: scripts/build-amd-adaptivecpp.dockerfile
             input2: scripts/install-dev.sh
             input3: scripts/install-dev.sh
             input4: scripts/build-amd-adaptivecpp.dockerfile
+            input5: scripts/build-amd-adaptivecpp.dockerfile
     env:
       # `runner` is unavailable while GitHub evaluates a job-level env block. Ubuntu runners are
       # ephemeral, so a fixed /tmp root has the same isolation and remains usable by actions/cache.
@@ -133,7 +135,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: /tmp/mom-buildx-cache/${{ matrix.scope }}
-          key: linux-x64-sycl-${{ matrix.scope }}-v3-${{ hashFiles(matrix.input1, matrix.input2, matrix.input3, matrix.input4) }}
+          key: linux-x64-sycl-${{ matrix.scope }}-v3-${{ hashFiles(matrix.input1, matrix.input2, matrix.input3, matrix.input4, matrix.input5) }}
           restore-keys: linux-x64-sycl-${{ matrix.scope }}-v3-
 
       - name: Free disk space
@@ -214,7 +216,7 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: /tmp/mom-buildx-cache/acpp-cuda
-          key: linux-x64-sycl-acpp-cuda-v3-${{ hashFiles('scripts/build-nvidia-adaptivecpp.dockerfile', 'scripts/patches/adaptivecpp-cuda-unloading.patch', 'scripts/install-dev.sh', 'scripts/install-cutlass.sh') }}
+          key: linux-x64-sycl-acpp-cuda-v3-${{ hashFiles('scripts/build-nvidia-adaptivecpp.dockerfile', 'scripts/patches/adaptivecpp-cuda-unloading.patch', 'scripts/install-dev.sh', 'scripts/install-cutlass.sh', 'scripts/install-nvrtc-current.sh') }}
           restore-keys: linux-x64-sycl-acpp-cuda-v3-
 
       - name: Restore AdaptiveCpp HIP image cache

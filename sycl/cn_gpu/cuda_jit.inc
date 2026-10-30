@@ -59,15 +59,20 @@ struct CnGpuCudaExpand {
       CnGpuNvrtcApi& rtc = CnGpuNvrtcApi::instance();
       if (!driver.basic_available())
         throw driver.error;
+      if (!driver.synchronize)
+        throw std::string("missing CUDA driver symbol cuCtxSynchronize");
       if (!rtc.ptx_available())
         throw rtc.error;
       cuda_check(driver, driver.init(0), "cuInit(cn/gpu)");
       device = native_device(queue.get_device());
-      int major = 0;
+      int major = 0, minor = 0;
       cuda_check(
           driver,
           driver.device_attribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device),
           "cuDeviceGetAttribute(cn/gpu major)");
+      cuda_check(driver,
+          driver.device_attribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device),
+          "cuDeviceGetAttribute(cn/gpu minor)");
       cuda_check(driver, driver.retain_primary(&context, device),
                  "cuDevicePrimaryCtxRetain(cn/gpu)");
       retained_primary = true;
@@ -76,12 +81,30 @@ struct CnGpuCudaExpand {
       const std::string source(
 #include "cuda_expand_kernel.inc"
       );
-      // Keep the cached program forward-compatible with GPUs newer than the installed NVRTC.
-      // CUDA 12.x cannot name Blackwell's compute_120 target, but its compute_80 PTX is accepted
-      // and optimized for the actual device by current drivers. Older GPUs retain the SYCL path.
+      // Native code avoids a newer compiler's PTX ISA requiring a newer driver.
+      // Unknown future devices/old compilers retain the existing compute80 PTX
+      // route; GPUs below SM80 still use the complete SYCL implementation.
       if (major < 8)
         throw std::string("the native cn/gpu expansion requires compute capability 8.0+");
-      const std::string architecture = "--gpu-architecture=compute_80";
+      if (major > 99 || minor < 0 || minor > 9)
+        throw std::string("invalid cn/gpu CUDA device capability");
+      const int device_arch = major * 10 + minor;
+      bool emit_cubin = false;
+      if (rtc.cubin_available()) {
+        int count = 0;
+        auto status = rtc.get_num_supported_archs(&count);
+        if (status != NVRTC_SUCCESS)
+          throw rtc_error(rtc, status, nullptr, "nvrtcGetNumSupportedArchs(cn/gpu)");
+        if (count <= 0 || count > 128)
+          throw std::string("invalid cn/gpu NVRTC architecture count");
+        std::vector<int> architectures(static_cast<size_t>(count));
+        status = rtc.get_supported_archs(architectures.data());
+        if (status != NVRTC_SUCCESS)
+          throw rtc_error(rtc, status, nullptr, "nvrtcGetSupportedArchs(cn/gpu)");
+        emit_cubin = std::find(architectures.begin(), architectures.end(), device_arch) != architectures.end();
+      }
+      const std::string target = emit_cubin ? "sm_" + std::to_string(device_arch) : "compute_80";
+      const std::string architecture = "--gpu-architecture=" + target;
       const std::vector<std::string> option_storage{"--std=c++17", architecture,
                                                     "--device-as-default-execution-space"};
       std::vector<const char*> options;
@@ -89,10 +112,10 @@ struct CnGpuCudaExpand {
         options.push_back(option.c_str());
 
       std::ostringstream key;
-      key << source << '\0' << architecture << "\0cn-gpu-expand-cuda-v1";
+      key << source << '\0' << architecture << "\0cn-gpu-expand-cuda-v2";
       std::ostringstream filename;
-      filename << "cn-gpu-expand-compute80-" << std::hex << std::setw(16) << std::setfill('0')
-               << mom::jit_cache::hash(key.str()) << ".ptx";
+      filename << "cn-gpu-expand-" << target << '-' << std::hex << std::setw(16) << std::setfill('0')
+               << mom::jit_cache::hash(key.str()) << (emit_cubin ? ".cubin" : ".ptx");
       const std::filesystem::path root = mom::jit_cache::directory();
       const std::filesystem::path path =
           root.empty() ? std::filesystem::path{} : root / filename.str();
@@ -112,13 +135,15 @@ struct CnGpuCudaExpand {
         if (status != NVRTC_SUCCESS)
           throw rtc_error(rtc, status, program.get(), "nvrtcCompileProgram(cn/gpu)");
         size_t size = 0;
-        status = rtc.get_ptx_size(program.get(), &size);
+        status = emit_cubin ? rtc.get_cubin_size(program.get(), &size) : rtc.get_ptx_size(program.get(), &size);
         if (status != NVRTC_SUCCESS)
-          throw rtc_error(rtc, status, program.get(), "nvrtcGetPTXSize(cn/gpu)");
+          throw rtc_error(rtc, status, program.get(), emit_cubin ? "nvrtcGetCUBINSize(cn/gpu)" : "nvrtcGetPTXSize(cn/gpu)");
+        if (!size || size > 128 * 1024 * 1024)
+          throw std::string("invalid cn/gpu NVRTC output size");
         code.resize(size);
-        status = rtc.get_ptx(program.get(), code.data());
+        status = emit_cubin ? rtc.get_cubin(program.get(), code.data()) : rtc.get_ptx(program.get(), code.data());
         if (status != NVRTC_SUCCESS)
-          throw rtc_error(rtc, status, program.get(), "nvrtcGetPTX(cn/gpu)");
+          throw rtc_error(rtc, status, program.get(), emit_cubin ? "nvrtcGetCUBIN(cn/gpu)" : "nvrtcGetPTX(cn/gpu)");
         program.reset();
         cuda_check(driver, driver.module_load(&module, code.data()), "cuModuleLoadData(cn/gpu)");
         mom::jit_cache::write(path, code);
@@ -149,11 +174,11 @@ struct CnGpuCudaExpand {
     void* args[] = {&state_arg, &scratchpad_arg, &batch_arg};
     constexpr unsigned threads = 32;
     const uint64_t total = static_cast<uint64_t>(batch) * 4096U;
-    cuda_check(api,
-               api.launch(kernel, static_cast<unsigned>((total + threads - 1) / threads), 1, 1,
-                          threads, 1, 1, 0, nullptr, args, nullptr),
-               "cuLaunchKernel(cn/gpu)");
-    cuda_check(api, api.event_record(done, nullptr), "cuEventRecord(cn/gpu)");
+    mom::cuda_check_submitted(
+        api, api.launch(kernel, static_cast<unsigned>((total + threads - 1) / threads), 1, 1,
+                        threads, 1, 1, 0, nullptr, args, nullptr),
+        "cuLaunchKernel(cn/gpu)");
+    mom::cuda_check_submitted(api, api.event_record(done, nullptr), "cuEventRecord(cn/gpu)");
   }
 
   // Poll native completion without busy-spinning and propagate driver faults.
@@ -164,7 +189,7 @@ struct CnGpuCudaExpand {
       if (status == CUDA_SUCCESS)
         return;
       if (status != CUDA_ERROR_NOT_READY)
-        cuda_check(api, status, "cuEventQuery(cn/gpu)");
+        mom::cuda_check_submitted(api, status, "cuEventQuery(cn/gpu)");
 #if defined(_WIN32)
       mom_sycl_poll_pause();
 #else

@@ -121,6 +121,7 @@ class NvrtcApi {
   HMODULE library_ = nullptr;
 #else
   void* library_ = nullptr;
+  void* builtins_library_ = nullptr;
 #endif
 
   template <typename T>
@@ -136,7 +137,8 @@ class NvrtcApi {
     return false;
   }
 
-  // Prefer installed current libraries; older PTX-only APIs remain usable without CUBIN support.
+  // All native algorithms share this compiler. Prefer the checksum-pinned, MoM-owned
+  // runtime without relinking an application's SDK; older installs remain optional fallbacks.
   NvrtcApi() {
 #if defined(_WIN32)
     const char* const names[] = {
@@ -147,16 +149,33 @@ class NvrtcApi {
         break;
     }
 #else
-    const char* const names[] = {"libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12"};
+    const char* const names[] = {
+      "/opt/mom/nvrtc-13.3.33/lib/libnvrtc.so.13.3.33",
+      "libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12"
+    };
     for (const char* const name : names) {
-      if ((library_ = dlopen(name, RTLD_NOW | RTLD_LOCAL)))
+      if ((library_ = dlopen(name, RTLD_NOW | RTLD_LOCAL))) {
+        // NVRTC opens its builtins by SONAME, not relative to this absolute
+        // compiler path. Keep the matching dependency loaded without changing
+        // the application's SDK, global linker configuration, or environment.
+        if (name[0] == '/' && !(builtins_library_ = dlopen(
+              "/opt/mom/nvrtc-13.3.33/lib/libnvrtc-builtins.so.13.3", RTLD_NOW | RTLD_LOCAL))) {
+          error = "the managed NVRTC builtins library is not installed";
+          return;
+        }
         break;
+      }
     }
 #endif
     if (!library_) {
       error = "NVRTC is not installed";
       return;
     }
+#if defined(_WIN32)
+    version = reinterpret_cast<decltype(version)>(GetProcAddress(library_, "nvrtcVersion"));
+#else
+    version = reinterpret_cast<decltype(version)>(dlsym(library_, "nvrtcVersion"));
+#endif
     const bool ptx =
       load_symbol(create_program, "nvrtcCreateProgram") &&
       load_symbol(compile_program, "nvrtcCompileProgram") &&
@@ -179,6 +198,8 @@ public:
   NvrtcApi& operator=(const NvrtcApi&) = delete;
 
   decltype(&nvrtcCreateProgram) create_program = nullptr;
+  // Optional: individual kernels may require a compiler version without disabling legacy JIT.
+  decltype(&nvrtcVersion) version = nullptr;
   decltype(&nvrtcCompileProgram) compile_program = nullptr;
   decltype(&nvrtcGetProgramLogSize) get_log_size = nullptr;
   decltype(&nvrtcGetProgramLog) get_log = nullptr;
@@ -246,6 +267,16 @@ inline void cuda_check(CudaDriverApi& api, const CUresult status,
   if (api.error_string)
     (void)api.error_string(status, &detail);
   throw std::string(operation) + ": " + (detail ? detail : "CUDA driver error");
+}
+
+// Manually launched work is invisible to SYCL queue drains. Retire it on an error before callers
+// can reuse/free its buffers; the cleanup status must not replace the original driver failure.
+// Native callers require synchronize before submitting work. Successful calls never synchronize.
+inline void cuda_check_submitted(CudaDriverApi& api, const CUresult status,
+                                 const char* const operation) {
+  if (status != CUDA_SUCCESS)
+    (void)api.synchronize();
+  cuda_check(api, status, operation);
 }
 
 // Attach the compiler's build log while the temporary program still owns it.
