@@ -4,6 +4,19 @@ template <typename T> static T* alloc_buffer(sycl::queue& q, size_t count) {
                                  : sycl::malloc_device<T>(count, q);
 }
 
+// Optional USM is a best-effort optimization: a SYCL allocation failure declines only that route.
+// Other exceptions remain visible to the outer allocation cleanup/error path.
+template <typename T> static T* alloc_optional(sycl::queue& q, const size_t count) {
+  try {
+    return alloc_buffer<T>(q, count);
+  } catch (const sycl::exception& error) {
+    if (error.code() == sycl::errc::memory_allocation ||
+        error.code() == sycl::errc::feature_not_supported)
+      return nullptr;
+    throw;
+  }
+}
+
 // Allocate a mandatory buffer and fail before kernels can observe a null pointer.
 template <typename T>
 static T* alloc_required(sycl::queue& q, const size_t count, const char* const name) {
@@ -17,9 +30,9 @@ static T* alloc_required(sycl::queue& q, const size_t count, const char* const n
 static void free_allocations(sycl::queue& q, Buffers& b) noexcept {
   for (void* pointer :
        {static_cast<void*>(b.EAL), static_cast<void*>(b.EBR), static_cast<void*>(b.EBRt),
-        static_cast<void*>(b.Ap), static_cast<void*>(b.Bp), static_cast<void*>(b.ApWmma),
-        static_cast<void*>(b.BpWmma), static_cast<void*>(b.EARp1), static_cast<void*>(b.EARp2),
-        static_cast<void*>(b.EBLq1), static_cast<void*>(b.EBLq2), static_cast<void*>(b.cA),
+        static_cast<void*>(b.Ap), static_cast<void*>(b.Bp), static_cast<void*>(b.EARp1),
+        static_cast<void*>(b.EARp2), static_cast<void*>(b.EBLq1), static_cast<void*>(b.EBLq2),
+        static_cast<void*>(b.cA),
         static_cast<void*>(b.cB), static_cast<void*>(b.key), static_cast<void*>(b.target),
         static_cast<void*>(b.CVA), static_cast<void*>(b.CVB),
         static_cast<void*>(b.transcript), static_cast<void*>(b.result)}) {
@@ -32,30 +45,48 @@ static void free_allocations(sycl::queue& q, Buffers& b) noexcept {
   b = Buffers{};
 }
 
+// A zero device limit is an unknown report, so retain the pre-admission behavior. Known limits
+// use the exact count helper and reserve the runtime headroom already shared by profile discovery.
+static bool pearlhash_required_layout_admitted(const PowDeviceProfile& capacity,
+                                               const PearlHashAllocationCounts& counts) {
+  if (capacity.max_alloc && counts.max_alloc > capacity.max_alloc)
+    return false;
+  if (capacity.global_mem) {
+    if (capacity.global_mem < pearlhash_runtime_reserve_bytes ||
+        counts.total_bytes > capacity.global_mem - pearlhash_runtime_reserve_bytes)
+      return false;
+  }
+  return true;
+}
+
 // Allocate the selected backend layout with checked dimensions and unwind partial failures.
 static Buffers alloc_buffers(sycl::queue& q, int m, int n, int k, int rank, bool hip_jit = false,
                              bool cuda_jit = false) {
   static_assert(sizeof(Result) <= pearlhash_result_allocation_bytes);
   Buffers b{};
+  // The native HIP search opens 4x64 cells to reduce transcript register pressure. Retain that
+  // geometry if source-JIT initialization declines: the portable fallback must use the same key.
+  b.proof_rows = hip_jit ? 4 : 16;
+  b.proof_cols = hip_jit ? 64 : 16;
+  const pearlhash_profile_t shape = {static_cast<unsigned>(m), static_cast<unsigned>(n),
+                                     static_cast<unsigned>(k), static_cast<unsigned>(rank)};
   PearlHashAllocationCounts counts{};
-  if (!pearlhash_allocation_counts({static_cast<unsigned>(m), static_cast<unsigned>(n),
-                                   static_cast<unsigned>(k), static_cast<unsigned>(rank)},
-                                  counts, hip_jit))
+  if (!pearlhash_allocation_counts(shape, counts))
     throw std::string("Invalid pearlhash allocation dimensions");
+  const sycl::device device = q.get_device();
+  const PowDeviceProfile capacity = {
+      1, device.get_info<sycl::info::device::global_mem_size>(),
+      device.get_info<sycl::info::device::max_mem_alloc_size>()};
+  if (!pearlhash_required_layout_admitted(capacity, counts))
+    throw std::string("PearlHash required allocation exceeds device capacity");
   try {
+    // Allocate the complete mandatory graph before the optional transcript. Native and portable
+    // matrix producers reuse Ap/Bp, so no optional native allocation can consume this capacity.
     b.EAL = alloc_required<int8_t>(q, counts.m_rank, "EAL");
     b.EBR = alloc_required<int8_t>(q, counts.n_rank, "EBR");
     b.EBRt = alloc_required<int8_t>(q, counts.n_rank, "EBRt");
     b.Ap = alloc_required<int8_t>(q, counts.m_k, "Ap");
     b.Bp = alloc_required<int8_t>(q, counts.n_k, "Bp");
-#if defined(MOM_SYCL_HAS_HIP)
-    // HIPRTC WMMA consumes an architecture-native fragment layout; keep its matrices separate
-    // from the portable SYCL layout used when source-JIT initialization is unavailable.
-    if (hip_jit) {
-      b.ApWmma = alloc_required<int8_t>(q, counts.m_k, "WMMA Ap");
-      b.BpWmma = alloc_required<int8_t>(q, counts.n_k, "WMMA Bp");
-    }
-#endif
     b.EARp1 = alloc_required<int32_t>(q, static_cast<size_t>(k), "EARp1");
     b.EARp2 = alloc_required<int32_t>(q, static_cast<size_t>(k), "EARp2");
     b.EBLq1 = alloc_required<int32_t>(q, static_cast<size_t>(k), "EBLq1");
@@ -66,32 +97,28 @@ static Buffers alloc_buffers(sycl::queue& q, int m, int n, int k, int rank, bool
     b.target = alloc_required<uint8_t>(q, 32, "target");
     b.CVA = alloc_required<uint8_t>(q, counts.cva_bytes, "CVA");
     b.CVB = alloc_required<uint8_t>(q, counts.cvb_bytes, "CVB");
-    // Keep BLAKE3 separate from the matrix loop to preserve occupancy. CUDA processes row slices:
-    // the full reference profile would otherwise need a 16-GiB transcript in addition to A'/B'.
-    // Other backends still require a complete transcript and keep their existing 256-MiB cap.
-    const int transcript_rows = cuda_jit
-        ? std::min(m, static_cast<int>(((1ULL << 32) / static_cast<unsigned>(n)) / 128) * 128)
-        : m;
-    const uint64_t transcript_bytes =
-        static_cast<uint64_t>(transcript_rows / 16) * (n / 16) * 16U * sizeof(uint32_t);
-    const uint64_t transcript_limit =
-        cuda_jit ? 1ULL << 30 : 256ULL * 1024U * 1024U;
-    const sycl::device device = q.get_device();
-    const PowDeviceProfile capacity = {
-        1, device.get_info<sycl::info::device::global_mem_size>(),
-        device.get_info<sycl::info::device::max_mem_alloc_size>()};
-    const bool transcript_fits = !cuda_jit ||
-        pearlhash_optional_allocation_fits(capacity, counts, transcript_bytes);
-    if (transcript_bytes > 0 && transcript_bytes <= transcript_limit && transcript_fits) {
-      b.transcript =
-          alloc_buffer<uint32_t>(q, static_cast<size_t>(transcript_bytes / sizeof(uint32_t)));
-      if (b.transcript)
-        b.transcript_rows = transcript_rows;
-    }
     b.result = sycl::malloc_shared<Result>(1, q);
     if (!b.result)
       throw std::string("Can't allocate pearlhash result");
     b.result->found = 0;
+    // CUDA source-JIT reuses bounded row slices; the portable layout retains its complete
+    // transcript allocation. The fused HIP kernel keeps its transcript in LDS.
+    const uint64_t transcript_limit = (cuda_jit ? 1024ULL : 256ULL) << 20;
+    const int transcript_rows = cuda_jit
+        ? std::min(m, static_cast<int>((transcript_limit * 4 / static_cast<unsigned>(n)) /
+                                      128) * 128)
+        : hip_jit ? 0 : m;
+    const uint64_t transcript_bytes =
+        static_cast<uint64_t>(transcript_rows / 16) * (n / 16) * 16U * sizeof(uint32_t);
+    const bool transcript_fits = !cuda_jit ||
+        pearlhash_optional_allocation_fits(capacity, counts, transcript_bytes);
+    if ((cuda_jit || !hip_jit) && transcript_bytes > 0 && transcript_bytes <= transcript_limit &&
+        transcript_fits) {
+      b.transcript = alloc_optional<uint32_t>(
+          q, static_cast<size_t>(transcript_bytes / sizeof(uint32_t)));
+      if (b.transcript)
+        b.transcript_rows = transcript_rows;
+    }
     return b;
   } catch (...) {
     free_allocations(q, b);
@@ -125,9 +152,17 @@ struct PearlHashState {
   int m = 0, n = 0, k = 0, rank = 0;
   bool hip_jit_buffers = false;
   bool cuda_jit_buffers = false;
+  // The first successful native-pair attempt supplies the retained B seed.  This flag is
+  // deliberately cleared at pearlhash entry and committed only after the full attempt/validation
+  // path completes, so a producer, queue, or proof-readback fault can never expose partial B state.
+  bool fixed_b_valid = false;
+  uint32_t fixed_b_seed = 0;
   Buffers b{};
   uint8_t key[32] = {0}, header[76] = {0};
   bool have_header = false;
+  bool header_pair_dist8 = false;
+  CompactRootPath compact_roots;
+  std::array<uint8_t,32> compact_a{},compact_b{};
   bool native_notice = false;
   double wait_ema_us = 0.0; // EMA of recent attempt wall times (us); paces the pre-wait sleep below
   std::mutex mutex;
@@ -149,7 +184,12 @@ struct PearlHashState {
     m = n = k = rank = 0;
     hip_jit_buffers = false;
     cuda_jit_buffers = false;
+    // The queue drain above must precede resetting async upload sources.
+    compact_roots.reset();compact_a.fill(0);compact_b.fill(0);
+    wait_ema_us=0.0;
+    fixed_b_valid = false;
     have_header = false;
+    header_pair_dist8 = false;
   }
   // Reallocate only when dimensions or native buffer layouts change; invalidate the cached job key afterward.
   void ensure(int m_, int n_, int k_, int rank_, bool hip_jit_, bool cuda_jit_) {
@@ -166,6 +206,7 @@ struct PearlHashState {
     hip_jit_buffers = hip_jit_;
     cuda_jit_buffers = cuda_jit_;
     have_header = false;
+    fixed_b_valid = false;
   }
   ~PearlHashState() {
     release();
@@ -187,11 +228,14 @@ thread_local std::string
 // Winning tile captured by pearlhash() on a find; consumed by pearlhash_claim() to build the proof lazily.
 thread_local struct PearlHashFound {
   uint32_t seed;
-  int row, col, m, n, k, rank;
+  uint32_t b_seed;
+  int row, col, m, n, k, rank, proof_rows, proof_cols;
   uint8_t key[32];
   uint8_t jackpot[32];
   uint32_t adjustment_factor;
   std::vector<CV> leaves_a, leaves_b;
+  bool pair_dist8;
+  bool positive_inputs;
   bool claim_ready;
   bool valid;
 } g_pf{};

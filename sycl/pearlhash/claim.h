@@ -27,4 +27,37 @@ inline bool pearlhash_adjustment_factor(const uint64_t selected_rows,
   return true;
 }
 
+// Native selection owns the real public opening pattern. Scale an unmodified
+// BE base target only here; a final jackpot target is merely reversed to LE.
+// Use byte multiplication with a 64-bit carry so any uint32 factor is safe;
+// saturate once after multiplication, never try to undo a clamped JS target.
+// Commit from a temporary so failure leaves output intact and aliases are safe.
+inline bool pearlhash_search_target_le(
+    const uint8_t* const final_be, const uint8_t* const base_be,
+    const uint64_t rows, const uint64_t columns, const uint64_t k, const uint64_t rank,
+    uint8_t* const output_le) {
+  if (!output_le || (!base_be && !final_be))
+    return false;
+  uint8_t bytes[32];
+  if (!base_be) {
+    for (unsigned i = 0; i < 32; ++i)
+      bytes[i] = final_be[31 - i];
+  } else {
+    uint32_t factor = 0;
+    if (!pearlhash_adjustment_factor(rows, columns, k, rank, &factor))
+      return false;
+    uint64_t carry = 0;
+    for (unsigned i = 0; i < 32; ++i) {
+      const uint64_t product = uint64_t(base_be[31 - i]) * factor + carry;
+      bytes[i] = static_cast<uint8_t>(product);
+      carry = product >> 8;
+    }
+    if (carry)
+      for (auto& byte : bytes) byte = 0xff;
+  }
+  for (unsigned i = 0; i < 32; ++i)
+    output_le[i] = bytes[i];
+  return true;
+}
+
 } // namespace mom_pearlhash

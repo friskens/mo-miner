@@ -25,10 +25,28 @@ using cuda::std::uint32_t;
 using cuda::std::uint64_t;
 
 using CtaTile = Shape<_128, _256, _128>;
+#if PEARLHASH_RANK == 128
+using TiledMma = decltype(make_tiled_mma(
+  SM80_16x8x32_S32U8U8S32_TN{},
+  Layout<Shape<_1, _1, _1>>{},
+  Tile<_64, _64, _32>{}));
+#else
 using TiledMma = decltype(make_tiled_mma(
   SM80_16x8x32_S32S8S8S32_TN{},
   Layout<Shape<_1, _1, _1>>{},
   Tile<_64, _64, _32>{}));
+#endif
+
+// Producer-packed K32 tiles. The layouts describe the same 64x32 packet
+// ownership checked by matrix.inc; they are layout tokens only, not shared
+// memory addresses. Rank-256 remains on the staged path below.
+using PackedALayout = Layout<
+  Shape<Shape<_8, Shape<_2, _4>>, Shape<_4, Shape<_4, _2>>>,
+  Stride<Stride<_64, Stride<_4, _512>>,
+         Stride<_1, Stride<_16, _8>>>>;
+using PackedBLayout = Layout<
+  Shape<Shape<_8, Shape<_2, _4>>, Shape<_4, Shape<_4, _2>>>,
+  Stride<Stride<_64, Stride<_8, _512>>, Stride<_1, Stride<_16, _4>>>>;
 
 using SmemLayoutA = decltype(composition(
   Swizzle<3, 4, 3>{},
@@ -74,6 +92,13 @@ __device__ __forceinline__ uint32_t load32(const unsigned char* p) {
 }
 __device__ __forceinline__ uint32_t rotr32(uint32_t x, int n) {
   return (x >> n) | (x << (32 - n));
+}
+// Express the checkpoint XOR tree as ternary logic: NVRTC otherwise emits binary XORs here.
+__device__ __forceinline__ uint32_t pearlhash_xor3(uint32_t a, uint32_t b, uint32_t c) {
+  uint32_t out;
+  asm volatile("lop3.b32 %0, %1, %2, %3, 0x96;"
+               : "=r"(out) : "r"(a), "r"(b), "r"(c));
+  return out;
 }
 __device__ __forceinline__ void b3_g(
     uint32_t* s, int a, int b, int c, int d, uint32_t x, uint32_t y) {
@@ -158,8 +183,23 @@ void pearlhash_cuda_hash(const uint32_t* transcript, const unsigned char* key,
       break;
     }
   }
-  const uint32_t row = uint32_t(row_offset) + (tile / tile_columns) * 16u;
-  const uint32_t col = (tile % tile_columns) * 16u;
+#if PEARLHASH_RANK == 128
+  // The GEMM producer stores 16 records in warp-major order: four row-pair
+  // classes by four column-pair classes inside each 64x64 warp tile.  Invert
+  // that dense index before hashing; treating it as ordinary row-major 16x16
+  // tiles would give the wrong physical proof origin for every nonzero class.
+  const uint32_t warp_tiles_n = uint32_t(n) / 64u;
+  const uint32_t warp_tile = tile / 16u;
+  const uint32_t slot = tile % 16u;
+  const uint32_t row = uint32_t(row_offset) + (warp_tile / warp_tiles_n) * 64u +
+                       (slot / 4u) * 2u;
+  const uint32_t col = (warp_tile % warp_tiles_n) * 64u + (slot % 4u) * 2u;
+#else
+  const uint32_t tile_row = tile / tile_columns;
+  const uint32_t tile_col = tile % tile_columns;
+  const uint32_t row = uint32_t(row_offset) + tile_row * 16u;
+  const uint32_t col = tile_col * 16u;
+#endif
   if (debug_checksum) {
     atomicAdd(&result->chk, tile_mix(row, col, transcript_words));
   }
@@ -177,6 +217,7 @@ void pearlhash_cuda_hash(const uint32_t* transcript, const unsigned char* key,
   }
 }
 
+#if PEARLHASH_RANK != 128
 extern "C" __global__ __launch_bounds__(256)
 void pearlhash_cuda_gemm(const int8_t* __restrict__ ap, const int8_t* __restrict__ bp,
                      int m, int n, int k, uint32_t* transcript_out) {
@@ -193,7 +234,7 @@ void pearlhash_cuda_gemm(const int8_t* __restrict__ ap, const int8_t* __restrict
   int block_m = int(blockIdx.x);
   int block_n = int(blockIdx.y);
   constexpr int swizzle_m = 16;
-  const int swizzle_n = k == 8192 ? 4 : 16;
+  const int swizzle_n = k == 8192 ? 2 : 16;
   const int grid_m = m / 128;
   const int grid_n = n / 256;
   if (grid_m % swizzle_m == 0 && grid_n % swizzle_n == 0) {
@@ -307,10 +348,18 @@ void pearlhash_cuda_gemm(const int8_t* __restrict__ ap, const int8_t* __restrict
         const int tile_c = tile & 3;
         const int lo = ((tile_c * 2) * 4 + tile_r) * 4;
         const int hi = ((tile_c * 2 + 1) * 4 + tile_r) * 4;
-        uint32_t part = uint32_t(accumulator(lo)) ^ uint32_t(accumulator(lo + 1)) ^
-                        uint32_t(accumulator(lo + 2)) ^ uint32_t(accumulator(lo + 3)) ^
-                        uint32_t(accumulator(hi)) ^ uint32_t(accumulator(hi + 1)) ^
-                        uint32_t(accumulator(hi + 2)) ^ uint32_t(accumulator(hi + 3));
+        const uint32_t v0 = uint32_t(accumulator(lo));
+        const uint32_t v1 = uint32_t(accumulator(lo + 1));
+        const uint32_t v2 = uint32_t(accumulator(lo + 2));
+        const uint32_t v3 = uint32_t(accumulator(lo + 3));
+        const uint32_t v4 = uint32_t(accumulator(hi));
+        const uint32_t v5 = uint32_t(accumulator(hi + 1));
+        const uint32_t v6 = uint32_t(accumulator(hi + 2));
+        const uint32_t v7 = uint32_t(accumulator(hi + 3));
+        const uint32_t p0 = pearlhash_xor3(v0, v1, v2);
+        const uint32_t p1 = pearlhash_xor3(v3, v4, v5);
+        const uint32_t p2 = v6 ^ v7;
+        uint32_t part = pearlhash_xor3(p0, p1, p2);
         // Every lane contributes to this tile. The native path already requires SM 8.0+,
         // where one warp reduction replaces the five shuffle/XOR steps.
         part = __reduce_xor_sync(0xffffffffu, part);
@@ -345,4 +394,189 @@ void pearlhash_cuda_gemm(const int8_t* __restrict__ ap, const int8_t* __restrict
     }
   }
 }
+
+#else
+
+// Load one lane's sixteen fragment words from four aligned producer packets.
+// cuda_search.inc establishes the 16-byte base alignment before dispatch.
+template<class Fragment>
+__device__ __forceinline__ void load_packed128(
+    const int8_t* base, int lane, Fragment& fragment) {
+  auto words = recast<uint32_t>(fragment);
+  static_assert(decltype(size(words))::value == 16, "one K32 fragment is sixteen registers");
+  CUTE_UNROLL
+  for (int group = 0; group < 4; ++group) {
+    uint32_t x, y, z, w;
+    const int8_t* address = base + uint64_t(group) * 512u + uint64_t(lane) * 16u;
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(x), "=r"(y), "=r"(z), "=r"(w) : "l"(address));
+    words(group * 4) = x;
+    words(group * 4 + 1) = y;
+    words(group * 4 + 2) = z;
+    words(group * 4 + 3) = w;
+  }
+}
+
+// Rank-128 keeps a current/next fragment pair per lane instead of shared stages.
+// Shape admission is host-side; the zero-K guard also protects the prime load.
+extern "C" __global__ __launch_bounds__(256)
+void pearlhash_cuda_gemm(const int8_t* __restrict__ ap, const int8_t* __restrict__ bp,
+                         int m, int n, int k, uint32_t* transcript_out) {
+  int block_m = int(blockIdx.x);
+  int block_n = int(blockIdx.y);
+  constexpr int swizzle_m = 16;
+  const int swizzle_n = k == 8192 ? 2 : 16;
+  const int grid_m = m / 128;
+  const int grid_n = n / 256;
+  if (grid_m % swizzle_m == 0 && grid_n % swizzle_n == 0) {
+    const int linear = int(blockIdx.y) * grid_m + int(blockIdx.x);
+    const int supertile = linear / (swizzle_m * swizzle_n);
+    const int local = linear % (swizzle_m * swizzle_n);
+    const int supertiles_n = grid_n / swizzle_n;
+    block_m = (supertile / supertiles_n) * swizzle_m + local / swizzle_n;
+    block_n = (supertile % supertiles_n) * swizzle_n + local % swizzle_n;
+  }
+
+  const int warp = int(threadIdx.x) >> 5;
+  const int lane = int(threadIdx.x) & 31;
+  const int warp_m = warp >> 2;
+  const int warp_n = warp & 3;
+  TiledMma mma;
+  auto thread_mma = mma.get_slice(lane);
+
+  // These are layout tokens only; make_smem_ptr(0) is never dereferenced.
+  auto static_a32 = make_tensor(
+      make_smem_ptr(reinterpret_cast<int8_t*>(0)),
+      Layout<Shape<_64, _32>, Stride<_32, _1>>{});
+  auto static_b32 = make_tensor(
+      make_smem_ptr(reinterpret_cast<int8_t*>(0)),
+      Layout<Shape<_64, _32>, Stride<_32, _1>>{});
+  auto fragment_a = thread_mma.partition_fragment_A(static_a32);
+  auto fragment_b = thread_mma.partition_fragment_B(static_b32);
+
+  Tensor identity = make_identity_tensor(make_shape(64, 64));
+  Tensor output_tile = local_tile(
+      identity, Shape<_64, _64, _128>{}, make_coord(0, 0, _), Step<_1, _1, X>{});
+  Tensor thread_output = thread_mma.partition_C(output_tile);
+  Tensor accumulator = thread_mma.make_fragment_C(thread_output);
+  clear(accumulator);
+  // Pair256's distributed queue stores even checkpoints in the emitter lane
+  // and odd checkpoints in its lane^4 partner.  The final store interleaves
+  // the two eight-word queues into the canonical 16-word transcript.
+  uint32_t transcript[8] = {};
+  int rank_chunk = 0;
+
+  auto next_a = thread_mma.partition_fragment_A(static_a32);
+  auto next_b = thread_mma.partition_fragment_B(static_b32);
+  static_assert(sizeof(uint64_t) == 8 && sizeof(size_t) >= 8,
+                "rank-128 packed CUDA offsets require 64-bit arithmetic");
+  constexpr uint64_t packed_tile_bytes = 64u * 32u;
+  const uint64_t k32_count = uint64_t(k) / 32u;
+  const uint64_t a_base = (uint64_t(block_m) * 2u + uint64_t(warp_m)) * k32_count;
+  const uint64_t b_base = (uint64_t(block_n) * 4u + uint64_t(warp_n)) * k32_count;
+  constexpr int k_tile = 128;
+  const int tiles_left = k / k_tile;
+  if (tiles_left <= 0)
+    return;
+
+  // Prime exactly once. Subsequent K32 steps consume the prefetched carry.
+  {
+    auto ga = make_tensor(make_gmem_ptr(ap + a_base * packed_tile_bytes), PackedALayout{});
+    auto gb = make_tensor(make_gmem_ptr(bp + b_base * packed_tile_bytes), PackedBLayout{});
+    load_packed128(ga.data().get(), lane, fragment_a);
+    load_packed128(gb.data().get(), lane, fragment_b);
+  }
+  // Keep the rolling recurrence numeric through the terminal one-past-packet
+  // value, avoiding construction of an out-of-range C++ pointer.
+  const uint64_t a_bytes = a_base * packed_tile_bytes;
+  const uint64_t b_bytes = b_base * packed_tile_bytes;
+  const uint64_t packet_end = k32_count * packed_tile_bytes;
+  uint64_t odd_bytes = packed_tile_bytes;
+  for (int tile = 0; tile < tiles_left; ++tile) {
+#pragma unroll 1
+    for (int pair = 0; pair < 2; ++pair) {
+      {
+        auto ga = make_tensor(make_gmem_ptr(ap + a_bytes + odd_bytes), PackedALayout{});
+        auto gb = make_tensor(make_gmem_ptr(bp + b_bytes + odd_bytes), PackedBLayout{});
+        load_packed128(ga.data().get(), lane, next_a);
+        load_packed128(gb.data().get(), lane, next_b);
+      }
+      gemm(mma, fragment_a, fragment_b, accumulator);
+      const uint64_t even_bytes = odd_bytes + packed_tile_bytes;
+      if (even_bytes < packet_end) {
+        auto ga = make_tensor(make_gmem_ptr(ap + a_bytes + even_bytes), PackedALayout{});
+        auto gb = make_tensor(make_gmem_ptr(bp + b_bytes + even_bytes), PackedBLayout{});
+        load_packed128(ga.data().get(), lane, fragment_a);
+        load_packed128(gb.data().get(), lane, fragment_b);
+      }
+      gemm(mma, next_a, next_b, accumulator);
+      odd_bytes += 2u * packed_tile_bytes;
+    }
+    ++rank_chunk;
+    constexpr int stages_per_rank = PEARLHASH_RANK / 128;
+    if (rank_chunk % stages_per_rank == 0) {
+      const int transcript_word = (rank_chunk - 1) & 15;
+      uint32_t lane_part_even = 0;
+      uint32_t lane_part_odd = 0;
+      CUTE_UNROLL
+      for (int tile_index = 0; tile_index < 16; ++tile_index) {
+        const int tile_r = tile_index >> 2;
+        const int tile_c = tile_index & 3;
+        const int lo = ((tile_c * 2) * 4 + tile_r) * 4;
+        const int hi = ((tile_c * 2 + 1) * 4 + tile_r) * 4;
+        const uint32_t v0 = uint32_t(accumulator(lo));
+        const uint32_t v1 = uint32_t(accumulator(lo + 1));
+        const uint32_t v2 = uint32_t(accumulator(lo + 2));
+        const uint32_t v3 = uint32_t(accumulator(lo + 3));
+        const uint32_t v4 = uint32_t(accumulator(hi));
+        const uint32_t v5 = uint32_t(accumulator(hi + 1));
+        const uint32_t v6 = uint32_t(accumulator(hi + 2));
+        const uint32_t v7 = uint32_t(accumulator(hi + 3));
+        const uint32_t p0 = pearlhash_xor3(v0, v1, v2);
+        const uint32_t p1 = pearlhash_xor3(v3, v4, v5);
+        const bool odd_tile = (tile_index & 1) != 0;
+        const uint32_t prior = odd_tile ? lane_part_odd : lane_part_even;
+        const uint32_t p2 = pearlhash_xor3(v6, v7, prior);
+        const uint32_t next = pearlhash_xor3(p0, p1, p2);
+        if (odd_tile)
+          lane_part_odd = next;
+        else
+          lane_part_even = next;
+        // partition_C gives this lane eight rows by sixteen columns (128 values).
+        // XOR all sixteen local 8-value groups, then pair adjacent row classes.
+      }
+      // Every lane participates in the shuffle.  Lanes lane^4 have the same
+      // column class and the adjacent row class, so their XOR is exactly the
+      // 16-row by 16-column strided checkpoint.  This is one cross-lane
+      // operation per checkpoint and does not alter the MMA or packed loads.
+      const uint32_t lane_part = lane_part_even ^ lane_part_odd;
+      const uint32_t paired_part =
+          lane_part ^ __shfl_xor_sync(0xffffffffu, lane_part, 4);
+      if (((lane >> 2) & 1) == (transcript_word & 1)) {
+        const uint32_t previous = transcript[0];
+        CUTE_UNROLL
+        for (int word = 0; word < 7; ++word)
+          transcript[word] = transcript[word + 1];
+        transcript[7] = ((previous << 13) | (previous >> 19)) ^ paired_part;
+      }
+    }
+  }
+
+  // Pair256 emits 16 records per 64x64 warp tile.  The row class is the pair
+  // lane>>3 (two adjacent classes); the column class remains lane&3.  This is
+  // a diagnostic dense layout only; the host serializer must use the matching
+  // 16x16 pattern before this can be a proof-producing worker path.
+  const uint64_t dense_proof_index =
+      ((uint64_t(block_m) * 2u + uint64_t(warp_m)) * uint64_t(n / 64) +
+       uint64_t(block_n) * 4u + uint64_t(warp_n)) * 16u +
+      uint64_t((lane >> 3) * 4 + (lane & 3));
+  CUTE_UNROLL
+  for (int word = 0; word < 8; ++word) {
+    const uint64_t output_word =
+        dense_proof_index * 16u + uint64_t(word * 2) + uint64_t((lane >> 2) & 1);
+    transcript_out[output_word] = transcript[word];
+  }
+}
+
+#endif
 )===CUDA"

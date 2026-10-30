@@ -27,6 +27,19 @@ bool Core::process_message(const std::string& type, const MessageValues& v) {
     if (is_big_target) {
       parse_big_target_hex(new_target_str, new_target_bin);
     }
+    // Preserve the original pool base target for Pearl's native pattern selection.
+    // A final jackpot target has no base field and must never be scaled twice.
+    const bool new_pearlhash_has_base_target = algo == "pearlhash" &&
+        v.contains("pearlhash_base_target");
+    uint8_t new_pearlhash_base_target[HASH_LEN]{};
+    if (new_pearlhash_has_base_target) {
+      std::string base = strip_hex_prefix(v.at("pearlhash_base_target"));
+      if (base.empty() || base.size() > HASH_LEN * 2)
+        throw std::string("Bad PearlHash base target hex");
+      if (base.size() & 1)
+        base.insert(0, 1, '0');
+      parse_big_target_hex(base, new_pearlhash_base_target);
+    }
     // The KarlsenHashV2 and Verthash kernels compare their little-endian-stored 32-byte hashes
     // against a little-endian target array (index 31 = MSB), but the share target hex is big-endian.
     // Reverse the bytes so target[31] is the MSB, matching the hash's LE byte layout. (is_test passes a
@@ -45,6 +58,10 @@ bool Core::process_message(const std::string& type, const MessageValues& v) {
     const std::string prev_job_token = m_job_token;
     set_job(JobMode::mine, true, v, [&]() {
       m_target    = new_target;
+      // This callback also runs on same-input retargets. Always replace/clear
+      // both the flag and bytes so final-target jobs cannot reuse an old base.
+      m_pearlhash_has_base_target = new_pearlhash_has_base_target;
+      std::memcpy(m_pearlhash_base_target_bin, new_pearlhash_base_target, HASH_LEN);
       if (is_big_target) {
         std::memcpy(m_target_bin, new_target_bin, HASH_LEN);
       }

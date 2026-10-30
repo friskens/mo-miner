@@ -42,6 +42,31 @@ inline void hip_queue_device(sycl::queue& queue, hipDevice_t& device) {
   hip_queue_identity(queue, device, stream);
 }
 
+// Query the actual HIP architecture after the caller has established that the queue is HIP.
+// Queue-interop errors intentionally propagate to mining callers; optional discovery callers may
+// catch them and retain the ordinary profile. Keep this query shared with the worker route so the
+// native/default capability boundary cannot drift.
+inline bool hip_gfx12_int8_wmma_supported(sycl::queue& queue,
+                                          std::string* const reason = nullptr) {
+  hipDevice_t device = -1;
+  hipStream_t stream = nullptr;
+  hipDeviceProp_t properties{};
+  hip_queue_identity(queue, device, stream);
+  const hipError_t properties_status = hipGetDeviceProperties(&properties, device);
+  if (properties_status != hipSuccess) {
+    if (reason)
+      *reason = std::string("hipGetDeviceProperties: ") +
+                hipGetErrorString(properties_status);
+    return false;
+  }
+  if (mom::amd::has_gfx12_int8_wmma(properties.gcnArchName))
+    return true;
+  if (reason)
+    *reason = std::string("gfx12 WMMA is unavailable on ") +
+              (properties.gcnArchName[0] ? properties.gcnArchName : "an unknown architecture");
+  return false;
+}
+
 // HIPRTC is optional at runtime. Keeping its entry points behind one dynamic loader lets each
 // source-JIT algorithm retain its portable SYCL fallback when the compiler library is unavailable.
 class HiprtcApi {

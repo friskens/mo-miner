@@ -342,6 +342,8 @@ void search_esimd(sycl::queue& q, const Buffers& bb, uint32_t seed, int m, int n
     if (pearlhash_wide_pipeline_route(width, rank, n)) {
       if (k == 4096)
         search_esimd_impl<16, 128, 4, 4096>(q, bb, seed, m, n, k, rank, dbg);
+      else if (k == 2048)
+        search_esimd_impl<16, 128, 4, 2048>(q, bb, seed, m, n, k, rank, dbg);
       else
         search_esimd_impl<16, 128, 4>(q, bb, seed, m, n, k, rank, dbg);
     }

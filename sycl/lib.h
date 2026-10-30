@@ -34,6 +34,10 @@ MOM_SYCL_API std::map<std::string, std::string> algo_params(
   const std::set<std::string>& gpu_beamhash3_algos
 );
 
+// GPU entry points reuse serialized per-device state. Internal event chains may overlap independent
+// stages, but caller-owned upload/readback memory must be retired before return or exception unwind.
+// C29 alone can leave host cycle searches pending: they own retired graph data, are drained by
+// input_size == 0 polls, and join at cleanup; they must never retain caller input/output pointers.
 MOM_SYCL_API void cn_gpu(
   const uint8_t* inputs, unsigned input_size, uint8_t* output,
   unsigned batch, const std::string& dev_str, const std::string& backend
@@ -199,7 +203,8 @@ MOM_SYCL_API int pearlhash(
   unsigned job_id, uint32_t height, const uint8_t* input, unsigned input_size, uint8_t* output,
   uint64_t* pseed, const uint8_t* target,
   unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str,
-  const std::string& backend, unsigned n, unsigned k, unsigned rank, unsigned cert_version
+  const std::string& backend, unsigned n, unsigned k, unsigned rank, unsigned cert_version,
+  const uint8_t* base_target = nullptr
 );
 MOM_SYCL_API const char* pearlhash_claim(uint8_t jackpot[32], uint32_t* adjustment_factor);
 // Rank-128-equivalent GEMM MACs per PearlHash attempt: m*n*k*128/rank.  This is the

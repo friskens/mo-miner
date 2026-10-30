@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 
 #include "../native/job-boundary.h"
 
@@ -59,8 +60,7 @@ struct PearlHashAllocationCounts {
 
 // Compute the exact allocation footprint for a legal shape; leave no partial counts on failure.
 inline bool pearlhash_allocation_counts(const pearlhash_profile_t& shape,
-                                        PearlHashAllocationCounts& out,
-                                        const bool hip_jit = false) {
+                                        PearlHashAllocationCounts& out) {
   out = {};
   if (!mom::job_boundary::valid_pearlhash_shape(shape.m, shape.n, shape.k, shape.rank))
     return false;
@@ -78,8 +78,7 @@ inline bool pearlhash_allocation_counts(const pearlhash_profile_t& shape,
   if (largest > std::numeric_limits<size_t>::max())
     return false;
   const uint64_t total = m_rank + 2 * n_rank + m_k + n_k + cva_bytes + cvb_bytes +
-      4 * noise_bytes + 4 * 32 + pearlhash_result_allocation_bytes +
-      (hip_jit ? m_k + n_k : 0);
+      4 * noise_bytes + 4 * 32 + pearlhash_result_allocation_bytes;
   out = {static_cast<size_t>(m_rank), static_cast<size_t>(n_rank),
          static_cast<size_t>(m_k), static_cast<size_t>(n_k),
          static_cast<size_t>(cva_bytes), static_cast<size_t>(cvb_bytes), largest, total};
@@ -93,6 +92,55 @@ inline bool pearlhash_required_memory_fits(const PowDeviceProfile& device,
   return device.max_alloc && device.global_mem >= pearlhash_runtime_reserve_bytes &&
       pearlhash_allocation_counts(shape, counts) && counts.max_alloc <= device.max_alloc &&
       counts.total_bytes <= device.global_mem - pearlhash_runtime_reserve_bytes;
+}
+
+// Amortize dispatch over the largest measured complete-SM-wave batch, bounded
+// by signed indexing and disjoint raw streams. Keep the smaller batch when
+// memory requires it; unknown capacity or missing native features fail closed.
+inline pearlhash_profile_t pearlhash_nvidia_compact_profile_for(
+    const PowDeviceProfile& device, const bool native_compact) {
+  if (!native_compact || !device.compute_units)
+    return {};
+  // The measured 36-SM class benefits from sixteen full waves on the wider
+  // grid. Other SM counts retain their existing batch until measured; exact
+  // memory admission also keeps smaller-allocation devices on that path.
+  if (device.compute_units == 36) {
+    constexpr uint64_t fast_n = 32768;
+    const uint64_t fast_quantum = uint64_t(192) * device.compute_units /
+        std::gcd(device.compute_units, unsigned(fast_n / 256));
+    const pearlhash_profile_t fast = {unsigned(16 * fast_quantum), unsigned(fast_n), 65536, 128};
+    if (pearlhash_required_memory_fits(device, fast))
+      return fast;
+  }
+  constexpr uint64_t n = 15360, k = 65536, minimum_m = 16000;
+  // Use the compact kernel's logical CTA rows, not its native warp-tile height.
+  const uint64_t quantum = uint64_t(192) * device.compute_units /
+      std::gcd(device.compute_units, unsigned(n / 256));
+  const uint64_t minimum = ((minimum_m + quantum - 1) / quantum) * quantum;
+  const uint64_t bound = std::min(uint64_t(std::numeric_limits<int32_t>::max()) / k,
+                                (uint64_t(1) << 32) / k - n);
+  const uint64_t preferred = bound / quantum * quantum;
+  for (const uint64_t m : {preferred, minimum}) {
+    if (m < minimum || m > bound)
+      continue;
+    const pearlhash_profile_t profile = {unsigned(m), unsigned(n), unsigned(k), 128};
+    if (pearlhash_required_memory_fits(device, profile))
+      return profile;
+  }
+  return {};
+}
+
+// Prefer measured native AMD profiles in throughput order, but admit every required allocation
+// and runtime headroom first. Unknown capability or capacity retains the portable profile.
+inline pearlhash_profile_t pearlhash_amd_native_profile_for(const PowDeviceProfile& device,
+                                                            const bool native_int8) {
+  if (native_int8) {
+    for (const auto& profile : {pearlhash_profile_t{524288, 524288, 2048, 128},
+                                pearlhash_profile_t{262144, 262144, 2048, 128}})
+      if (pearlhash_required_memory_fits(device, profile))
+        return profile;
+  }
+  return {131072, 131072, 2048, 128};
 }
 
 // Admit an optional fast-path buffer without stealing the required buffers' reserved capacity.

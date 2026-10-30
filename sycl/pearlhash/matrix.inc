@@ -42,14 +42,23 @@ template <int N, class F> static inline void MU(F&& f) {
 }
 
 // counter-based RNG (lowbias32) -- the deterministic A/B matrix generator
-static inline int8_t gv(uint32_t seed, uint32_t idx) {
+// Legal raw bytes 63/64 plus rank noise [-63,63] give nonnegative int8 operands [0,127].
+// Native INT8 routes benefit from this data pattern without changing work or proof rules;
+// false retains the reference stream for other routes. Roots and openings share this mode.
+static inline int8_t gv(uint32_t seed, uint32_t idx, bool positive_inputs = false,
+                        bool seed_prefix_inputs = false) {
+  // Only the compact raw solver uses this legal stream. Legacy native inputs
+  // remain the hashed 63/64 stream, rather than inheriting a new seed contract.
+  if (positive_inputs && seed_prefix_inputs)
+    return static_cast<int8_t>(idx < 32 ? 63 + ((seed >> idx) & 1u) : 64);
   uint32_t x = seed + idx * 0x9e3779b9u;
   x ^= x >> 16;
   x *= 0x7feb352du;
   x ^= x >> 15;
   x *= 0x846ca68bu;
   x ^= x >> 16;
-  return (int8_t)((x & 127) - 64);
+  return positive_inputs ? static_cast<int8_t>(63 + (x & 1u))
+                         : static_cast<int8_t>((x & 127u) - 64);
 }
 static inline uint32_t mulhi(uint32_t a, uint32_t b) {
   return (uint32_t)(((uint64_t)a * (uint64_t)b) >> 32);
@@ -97,19 +106,28 @@ struct Result {
 };
 
 struct Buffers {
+  int proof_rows = 16, proof_cols = 16;
   int8_t *EAL, *EBR, *EBRt, *Ap, *Bp; // A'/B' (noised, search inputs); A/B regenerated from RNG
-  int8_t *ApWmma, *BpWmma;
   int32_t *EARp1, *EARp2, *EBLq1, *EBLq2;
   uint8_t *cA, *cB, *key, *target, *CVA, *CVB;
   uint32_t* transcript;
   int transcript_rows;
   Result* result;
+  bool positive_inputs = false; // bound to this attempt and retained with winning proof leaves
+  bool seed_prefix_inputs = false; // admitted compact route only; cleared on every attempt
+  // Appended host-dispatch bit: only the admitted native CUDA pair route may retain B's
+  // producer/commitment layout between attempts. All shared kernels leave it false.
+  bool fixed_b_reuse = false;
+  uint32_t fixed_b_seed = 0;
 };
 
 // Generate B-side rank noise and write either the direct or transposed search layout.
 template <bool DirectLayout>
-static void k_noise_ebr(sycl::queue& q, const Buffers& B, int n, int rank, int blocks) {
-  q.parallel_for(sycl::range<1>(blocks), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+static sycl::event k_noise_ebr(sycl::queue& q, const Buffers& B, int n, int rank, int blocks,
+                               const sycl::event& roots) {
+  return q.submit([&](sycl::handler& h) {
+    h.depends_on(roots);
+    h.parallel_for(sycl::range<1>(blocks), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
     const int i = (int)id[0];
     uint8_t sd[32];
     mk_seed(sd, 'B');
@@ -126,36 +144,44 @@ static void k_noise_ebr(sycl::queue& q, const Buffers& B, int n, int rank, int b
       else
         B.EBRt[o] = value;
     }
+    });
   });
 }
 
-// Parallel BLAKE3 Merkle reduction of `nc` contiguous chunk CVs in `cvs` (uint8 buffer sized
-// >= 2*nc*32). For power-of-two nc the largest-power-of-two split degenerates to a balanced
-// binary tree, so a pairwise level reduction is bit-identical to merge_root(). Each level reads
-// the previous level's CV region and writes a fresh, non-overlapping region (no in-place race);
-// the final parent carries the ROOT flag. Returns the CV-unit offset of the root. Falls back to
-// nothing here — caller must guarantee nc is a power of two for this path.
-static int reduce_tree_pow2(sycl::queue& q, uint8_t* cvs, const uint8_t* key, int nc) {
-  int rd = 0, wr = nc, cnt = nc;
+// Keep the original leaves for cached PlainProof openings. Parent levels alternate between
+// disjoint regions in the existing 2*nc-CV allocation; carrying an odd tail unchanged preserves
+// BLAKE3's left-power-of-two tree. Requires nc > 0 and the state's in-order queue so each level
+// finishes before the next reads it. Returns the CV-unit offset of the root.
+static size_t reduce_tree(sycl::queue& q, uint8_t* cvs, const uint8_t* key, int nc) {
+  const size_t first = static_cast<size_t>(nc);
+  const size_t second = first + static_cast<size_t>(nc / 2 + nc % 2);
+  size_t rd = 0, wr = first;
+  int cnt = nc;
   while (cnt > 1) {
-    int half = cnt / 2;
-    bool isRoot = (half == 1);
-    int rd0 = rd, wr0 = wr;
-    q.parallel_for(sycl::range<1>(half), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
-      int i = (int)id[0];
-      pearlhash_b3::parent_cv(cvs + (size_t)(rd0 + 2 * i) * 32,
-                              cvs + (size_t)(rd0 + 2 * i + 1) * 32, key, isRoot,
-                              cvs + (size_t)(wr0 + i) * 32);
+    const int parents = cnt / 2 + cnt % 2;
+    const bool is_root = cnt == 2;
+    const int count = cnt;
+    const size_t rd0 = rd, wr0 = wr;
+    q.parallel_for(sycl::range<1>(parents), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+      const size_t i = id[0], child = i * 2;
+      const uint8_t* left = cvs + (rd0 + child) * 32;
+      uint8_t* out = cvs + (wr0 + i) * 32;
+      if (child + 1 < static_cast<size_t>(count))
+        pearlhash_b3::parent_cv(left, left + 32, key, is_root, out);
+      else
+        for (int byte = 0; byte < 32; ++byte)
+          out[byte] = left[byte];
     });
     rd = wr;
-    wr += half;
-    cnt = half;
+    wr = wr == first ? second : first;
+    cnt = parents;
   }
   return rd;
 }
-[[maybe_unused]] static void k_roots(sycl::queue& q, const Buffers& bb, uint32_t seed, int m, int n,
-                                     int k) {
+[[maybe_unused]] static sycl::event k_roots(sycl::queue& q, const Buffers& bb, uint32_t seed, int m,
+                                            int n, int k) {
   auto B = bb;
+  const bool reuse_b = B.fixed_b_reuse;
   const size_t lenA = checked_elements(m, k, "M*K roots");
   const size_t lenB = checked_elements(n, k, "N*K roots");
   const uint32_t tot = static_cast<uint32_t>(lenA);
@@ -169,66 +195,71 @@ static int reduce_tree_pow2(sycl::queue& q, uint8_t* cvs, const uint8_t* key, in
     const size_t len = remaining < 1024 ? remaining : 1024;
     uint8_t buf[1024];
     for (size_t t = 0; t < len; t++)
-      buf[t] = static_cast<uint8_t>(gv(seed, static_cast<uint32_t>(off + t)));
+      buf[t] = static_cast<uint8_t>(gv(seed, static_cast<uint32_t>(off + t),
+                                        B.positive_inputs, B.seed_prefix_inputs));
     pearlhash_b3::chunk_cv(buf, static_cast<uint32_t>(len), static_cast<uint64_t>(ci), B.key,
                            B.CVA + ci * 32);
   });
   // B' root is over Bt (n x k); each 1024-byte chunk of the Bt byte-stream is regenerated straight
   // from B's RNG (B[i]=gv(seed,tot+i)) so neither B nor a transposed Bt buffer exists. Bt byte
-  // b -> B[(b%k)*n + b/k].
-  q.parallel_for(sycl::range<1>(ncB), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
-    const size_t ci = id[0];
-    const size_t off = ci * 1024;
-    const size_t remaining = lenB - off;
-    const size_t len = remaining < 1024 ? remaining : 1024;
-    uint8_t buf[1024];
-    size_t j = off / static_cast<size_t>(k);
-    size_t r = off % static_cast<size_t>(k); // Bt byte -> column j, depth r of B
-    for (size_t t = 0; t < len; t++) {
-      const size_t source_offset = r * static_cast<size_t>(n) + j;
-      buf[t] = static_cast<uint8_t>(gv(seed, tot + static_cast<uint32_t>(source_offset)));
-      if (++r == static_cast<size_t>(k)) {
-        r = 0;
-        j++;
+  // b -> B[(b%k)*n + b/k]. A fixed-B pair attempt retains CVB/cB and skips this whole producer.
+  if (!reuse_b) {
+    q.parallel_for(sycl::range<1>(ncB), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+      const size_t ci = id[0];
+      const size_t off = ci * 1024;
+      const size_t remaining = lenB - off;
+      const size_t len = remaining < 1024 ? remaining : 1024;
+      uint8_t buf[1024];
+      size_t j = off / static_cast<size_t>(k);
+      size_t r = off % static_cast<size_t>(k); // Bt byte -> column j, depth r of B
+      for (size_t t = 0; t < len; t++) {
+        const size_t source_offset = r * static_cast<size_t>(n) + j;
+        buf[t] = static_cast<uint8_t>(
+            gv(seed, tot + static_cast<uint32_t>(source_offset),
+               B.positive_inputs, B.seed_prefix_inputs));
+        if (++r == static_cast<size_t>(k)) {
+          r = 0;
+          j++;
+        }
       }
-    }
-    pearlhash_b3::chunk_cv(buf, static_cast<uint32_t>(len), static_cast<uint64_t>(ci), B.key,
-                           B.CVB + ci * 32);
-  });
-  // Both branches bind the raw roots and matrix dimensions into the same salted commitment chain;
-  // they differ only in how each tree root is obtained (parallel reduction or serial merge_root).
-  const bool pow2 = ((ncA & (ncA - 1)) == 0) && ((ncB & (ncB - 1)) == 0);
-  const int ncA_int = static_cast<int>(ncA);
-  const int ncB_int = static_cast<int>(ncB);
-  if (pow2) {
-    int offA = reduce_tree_pow2(q, B.CVA, B.key, ncA_int);
-    int offB = reduce_tree_pow2(q, B.CVB, B.key, ncB_int);
-    q.single_task([=]() MOM_SYCL_KERNEL_ARGS_RESTRICT {
-      uint8_t rootA[32], rootB[32];
-      for (int i = 0; i < 32; i++) {
-        rootB[i] = B.CVB[(size_t)offB * 32 + i];
-      }
-      for (int i = 0; i < 32; i++)
-        rootA[i] = B.CVA[(size_t)offA * 32 + i];
-      pearlhash_commitment_seeds(B.key, rootA, rootB, static_cast<uint32_t>(m),
-                                 static_cast<uint32_t>(n), B.cB, B.cA);
-    });
-  } else {
-    q.single_task([=]() MOM_SYCL_KERNEL_ARGS_RESTRICT {
-      uint8_t rootA[32], rootB[32];
-      pearlhash_b3::merge_root(B.CVA, ncA_int, B.key, rootA);
-      pearlhash_b3::merge_root(B.CVB, ncB_int, B.key, rootB);
-      pearlhash_commitment_seeds(B.key, rootA, rootB, static_cast<uint32_t>(m),
-                                 static_cast<uint32_t>(n), B.cB, B.cA);
+      pearlhash_b3::chunk_cv(buf, static_cast<uint32_t>(len), static_cast<uint64_t>(ci), B.key,
+                             B.CVB + ci * 32);
     });
   }
+  const size_t offA = reduce_tree(q, B.CVA, B.key, static_cast<int>(ncA));
+  const size_t offB = reuse_b ? 0 : reduce_tree(q, B.CVB, B.key, static_cast<int>(ncB));
+  return q.single_task([=]() MOM_SYCL_KERNEL_ARGS_RESTRICT {
+    uint8_t rootA[32], rootB[32];
+    for (int i = 0; i < 32; ++i)
+      rootA[i] = B.CVA[offA * 32 + i];
+    if (reuse_b) {
+      // cB remains the fixed seed's commitment; only cA depends on this attempt's A root.
+      pearlhash_commitment_seed_a(B.cB, rootA, static_cast<uint32_t>(m), B.cA);
+    } else {
+      for (int i = 0; i < 32; ++i)
+        rootB[i] = B.CVB[offB * 32 + i];
+      pearlhash_commitment_seeds(B.key, rootA, rootB, static_cast<uint32_t>(m),
+                                 static_cast<uint32_t>(n), B.cB, B.cA);
+    }
+  });
 }
 
-[[maybe_unused]] static void k_noise(sycl::queue& q, const Buffers& bb, int m, int n, int k,
-                                     int rank) {
+// Two independent producer streams return their final A/B events through one shared contract.
+struct PearlHashEventPair {
+  sycl::event a, b;
+};
+
+// Generate A and B noise on their owning queues. Passing the root event makes the split queue
+// safe while retaining the same in-order single-queue behavior for portable backends.
+[[maybe_unused]] static PearlHashEventPair k_noise(sycl::queue& a_queue, sycl::queue& b_queue,
+                                                      const Buffers& bb, int m, int n,
+                                                      int k, int rank, const sycl::event& roots) {
   auto B = bb;
+  const bool reuse_b = B.fixed_b_reuse;
   const int dAL = (m * rank + 31) / 32, dBR = (n * rank + 31) / 32, dP = (k * 4 + 31) / 32;
-  q.parallel_for(sycl::range<1>(dAL), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+  sycl::event a_noise = a_queue.submit([&](sycl::handler& h) {
+    h.depends_on(roots);
+    h.parallel_for(sycl::range<1>(dAL), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
     int i = (int)id[0];
     uint8_t sd[32];
     mk_seed(sd, 'A');
@@ -240,17 +271,33 @@ static int reduce_tree_pow2(sycl::queue& q, uint8_t* cvs, const uint8_t* key, in
       if (o < total)
         B.EAL[o] = (int8_t)((h[j] & 63) - 32);
     }
+    });
   });
-  const bool cpu = q.get_device().is_cpu();
-  if (cpu) {
+  const bool cpu = a_queue.get_device().is_cpu();
+  sycl::event b_noise = a_noise;
+  if (!reuse_b && cpu) {
     // The Windows OpenCL CPU runtime faults in the otherwise-trivial transpose kernel. Its small
     // compatibility workload writes the final layout directly; GPUs retain coalesced generation
     // plus transpose, which is substantially faster for production matrix sizes.
-    k_noise_ebr<true>(q, B, n, rank, dBR);
-  } else {
-    k_noise_ebr<false>(q, B, n, rank, dBR);
+    b_noise = k_noise_ebr<true>(b_queue, B, n, rank, dBR, roots);
+  } else if (!reuse_b) {
+    b_noise = k_noise_ebr<false>(b_queue, B, n, rank, dBR, roots);
   }
-  q.parallel_for(sycl::range<1>(dP), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+  // The direct CPU layout was submitted above only to retain its compatibility path. GPU B noise
+  // uses the transposed temporary followed by one device-side copy, both on b_queue.
+  if (!reuse_b && !cpu) {
+    b_noise = b_queue.submit([&](sycl::handler& h) {
+      h.depends_on(b_noise);
+      h.parallel_for(sycl::range<1>((size_t)rank * n), [=](sycl::id<1> id)
+                                                           MOM_SYCL_KERNEL_ARGS_RESTRICT {
+        const int idx = (int)id[0], r = idx / n, c = idx % n;
+        B.EBR[idx] = B.EBRt[c * rank + r];
+      });
+    });
+  }
+  sycl::event a_indices = a_queue.submit([&](sycl::handler& h) {
+    h.depends_on(a_noise);
+    h.parallel_for(sycl::range<1>(dP), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
     int i = (int)id[0];
     uint8_t sd[32];
     mk_seed(sd, 'A');
@@ -262,42 +309,45 @@ static int reduce_tree_pow2(sycl::queue& q, uint8_t* cvs, const uint8_t* key, in
         break;
       perm_pair(rd_u32le(h + kk * 4), rank, B.EARp1[idx], B.EARp2[idx]);
     }
-  });
-  q.parallel_for(sycl::range<1>(dP), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
-    int i = (int)id[0];
-    uint8_t sd[32];
-    mk_seed(sd, 'B');
-    uint8_t h[32];
-    dev_randHash(i, sd, B.cB, 1, h);
-    for (int kk = 0; kk < 8; kk++) {
-      int idx = i * 8 + kk;
-      if (idx >= k)
-        break;
-      perm_pair(rd_u32le(h + kk * 4), rank, B.EBLq1[idx], B.EBLq2[idx]);
-    }
-  });
-  if (!cpu) {
-    q.parallel_for(
-        sycl::range<1>((size_t)rank * n), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
-      const int idx = (int)id[0], r = idx / n, c = idx % n;
-      B.EBR[idx] = B.EBRt[c * rank + r];
     });
-  }
+  });
+  if (reuse_b)
+    return {a_indices, a_indices};
+  sycl::event b_indices = b_queue.submit([&](sycl::handler& h) {
+    h.depends_on(b_noise);
+    h.parallel_for(sycl::range<1>(dP), [=](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+      int i = (int)id[0];
+      uint8_t sd[32];
+      mk_seed(sd, 'B');
+      uint8_t h[32];
+      dev_randHash(i, sd, B.cB, 1, h);
+      for (int kk = 0; kk < 8; kk++) {
+        int idx = i * 8 + kk;
+        if (idx >= k)
+          break;
+        perm_pair(rd_u32le(h + kk * 4), rank, B.EBLq1[idx], B.EBLq2[idx]);
+      }
+    });
+  });
+  return {a_indices, b_indices};
 }
 
 // Host reference for GPU commitment-seed checks and the Windows CPU compatibility path.
-static void prepare_roots_cpu(const Buffers& B, uint32_t seed, int m, int n, int k) {
+static void prepare_roots_cpu(const Buffers& B, uint32_t seed, int m, int n, int k,
+                              const uint32_t* b_seed_override = nullptr) {
   const size_t lenA = checked_elements(m, k, "M*K roots");
   const size_t lenB = checked_elements(n, k, "N*K roots");
   const size_t ncA = checked_chunk_count(lenA, "A root");
   const size_t ncB = checked_chunk_count(lenB, "B root");
   const uint32_t tot = static_cast<uint32_t>(lenA);
+  const uint32_t b_seed = b_seed_override ? *b_seed_override : seed;
   uint8_t chunk[1024];
   for (size_t ci = 0; ci < ncA; ++ci) {
     const size_t off = ci * 1024;
     const size_t len = std::min(size_t{1024}, lenA - off);
     for (size_t t = 0; t < len; ++t)
-      chunk[t] = static_cast<uint8_t>(gv(seed, static_cast<uint32_t>(off + t)));
+      chunk[t] = static_cast<uint8_t>(gv(seed, static_cast<uint32_t>(off + t),
+                                          B.positive_inputs, B.seed_prefix_inputs));
     pearlhash_b3::chunk_cv(chunk, static_cast<uint32_t>(len), static_cast<uint64_t>(ci), B.key,
                            B.CVA + ci * 32);
   }
@@ -307,7 +357,9 @@ static void prepare_roots_cpu(const Buffers& B, uint32_t seed, int m, int n, int
     size_t j = off / static_cast<size_t>(k), r = off % static_cast<size_t>(k);
     for (size_t t = 0; t < len; ++t) {
       const size_t source_offset = r * static_cast<size_t>(n) + j;
-      chunk[t] = static_cast<uint8_t>(gv(seed, tot + static_cast<uint32_t>(source_offset)));
+      chunk[t] = static_cast<uint8_t>(
+          gv(b_seed, tot + static_cast<uint32_t>(source_offset),
+             B.positive_inputs, B.seed_prefix_inputs));
       if (++r == static_cast<size_t>(k)) {
         r = 0;
         ++j;
@@ -367,13 +419,29 @@ static void prepare_noise_cpu(const Buffers& B, int m, int n, int k, int rank) {
 }
 #endif
 
-template <bool Dpasw = false>
+// Inverse of the CUTE SM80 K32 fragment map used by the unified rank-128 CUDA
+// payload. Every logical 64x32 tile remains 2048 bytes and every destination
+// expression is size_t so the full B operand may end exactly at 2^32 bytes.
+template <bool IsA>
+static inline size_t nvidia_vector128_offset(size_t row, size_t depth, int k) {
+  const size_t lane = 4U * (row & 7U) + ((depth >> 2U) & 3U);
+  const size_t word = IsA
+      ? ((row & 63U) >> 4U) * 4U + ((depth >> 4U) & 1U) * 2U + ((row >> 3U) & 1U)
+      : (((row & 63U) >> 3U) * 2U) + ((depth >> 4U) & 1U);
+  return ((row / 64U) * static_cast<size_t>(k / 32) + depth / 32U) * 2048U +
+         (word / 4U) * 512U + lane * 16U + (word % 4U) * 4U + (depth & 3U);
+}
+
+template <bool Dpasw = false, bool PackedCuda = false>
 [[maybe_unused]] static sycl::event compute_ab(sycl::queue& q, const Buffers& bb, uint32_t seed,
-                                                int m, int n, int k, int rank, bool portable) {
+                                                int m, int n, int k, int rank, bool portable,
+                                                bool force_b_pack = false) {
   auto B = bb;
   const size_t a_elements = checked_elements(m, k, "M*K");
   const size_t b_elements = checked_elements(n, k, "N*K");
   const uint32_t tot = static_cast<uint32_t>(a_elements);
+  const bool positive_inputs = B.positive_inputs;
+  const uint32_t b_seed = B.fixed_b_reuse ? B.fixed_b_seed : seed;
   // Explicit capture list (not [=]): capturing the extra `portable` bool under [=] makes the host
   // (icx) and device (clang) compilers disagree on the lambda layout in the dual-compiler combined
   // build ("Unexpected kernel lambda size"). Listing the captures explicitly keeps them in sync.
@@ -381,16 +449,18 @@ template <bool Dpasw = false>
   int8_t* const ap = B.Ap;
   int32_t* const earp1 = B.EARp1;
   int32_t* const earp2 = B.EARp2;
-  q.parallel_for(sycl::range<1>(a_elements), [eal, ap, earp1, earp2, seed, k, rank,
-                                               portable](sycl::id<1> id)
+  sycl::event a_event = q.parallel_for(sycl::range<1>(a_elements),
+                                       [eal, ap, earp1, earp2, seed, k, rank,
+                                               portable, positive_inputs](sycl::id<1> id)
       MOM_SYCL_KERNEL_ARGS_RESTRICT {
     const size_t idx = id[0], i = idx / static_cast<size_t>(k), c = idx % static_cast<size_t>(k);
     const int acc = static_cast<int>(eal[i * static_cast<size_t>(rank) + earp1[c]]) -
                     static_cast<int>(eal[i * static_cast<size_t>(rank) + earp2[c]]);
-    const int8_t v = static_cast<int8_t>(gv(seed, static_cast<uint32_t>(idx)) + acc);
+    const int8_t v = static_cast<int8_t>(
+        gv(seed, static_cast<uint32_t>(idx), positive_inputs) + acc);
 #if defined(__NVPTX__) && (!defined(MOM_SYCL_ADAPTIVECPP) || defined(__CUDA_ARCH__))
     (void)portable;
-    ap[idx] = v; // row-major A' for the NVIDIA mma.sync search_cuda (nvptx device pass)
+    ap[PackedCuda ? nvidia_vector128_offset<true>(i, c, k) : idx] = v;
 #else
     // The spir64 image carries BOTH searches; the host sets `portable` to match the one it will launch:
     //  - portable (the dp4a int8 GEMM search(), used by every OpenCL device -- AMD, the CPU device, and
@@ -406,8 +476,14 @@ template <bool Dpasw = false>
     }
 #endif
   });
+  // Native pair retries retain the packed B bytes.  The GPU test oracle temporarily regenerates
+  // portable row-major B' for its scalar checksum; force_b_pack restores the packed layout before
+  // the next native attempt while still using the retained B seed.
+  if (B.fixed_b_reuse && PackedCuda && !force_b_pack)
+    return a_event;
   // B' layout matches the search variant that will run (explicit capture, same reason as above):
-  //  - nvptx (__NVPTX__): COLUMN-major for the mma.sync B operand (coalesced 32-bit loads).
+  //  - native rank-128 CUDA: producer-packed K32 packets for direct vector loads;
+  //    other nvptx paths retain COLUMN-major mma.sync B operands.
   //  - portable (dp4a search()): COLUMN-major B'[r,j] at j*k+r, so each output column reads a
   //    contiguous int8 run over k -- the dp4a counterpart to the row-major A'.
   //  - else (Intel XMX ESIMD): TILE-MAJOR VNNI, each 16-wide N-tile's k*16 block contiguous (stride 64),
@@ -421,7 +497,7 @@ template <bool Dpasw = false>
     // words instead of scattering one byte across distant column banks. K is a multiple of 64.
     if (!portable) {
       return q.parallel_for(sycl::range<1>(b_elements / 4),
-          [ebr, bp, eblq1, eblq2, seed, tot, k, n](sycl::id<1> id)
+              [ebr, bp, eblq1, eblq2, b_seed, tot, k, n, positive_inputs](sycl::id<1> id)
               MOM_SYCL_KERNEL_ARGS_RESTRICT {
         const size_t word = id[0];
         const size_t j = (word / (static_cast<size_t>(k) * 2)) * 8 + word % 8;
@@ -432,7 +508,7 @@ template <bool Dpasw = false>
           const int acc = static_cast<int>(ebr[static_cast<size_t>(eblq1[r]) * n + j]) -
                           static_cast<int>(ebr[static_cast<size_t>(eblq2[r]) * n + j]);
           packed[part] = static_cast<int8_t>(
-              gv(seed, tot + static_cast<uint32_t>(r * n + j)) + acc);
+              gv(b_seed, tot + static_cast<uint32_t>(r * n + j), positive_inputs) + acc);
         });
         packed.store(word,
             sycl::multi_ptr<int8_t, sycl::access::address_space::global_space>(bp));
@@ -450,7 +526,7 @@ template <bool Dpasw = false>
       const size_t groups_j = (static_cast<size_t>(n) + 31) / 32;
       h.parallel_for(
           sycl::nd_range<2>(sycl::range<2>(groups_r * 8, groups_j * 32), sycl::range<2>(8, 32)),
-          [ebr, bp, eblq1, eblq2, seed, tot, k, n, tile](sycl::nd_item<2> item)
+          [ebr, bp, eblq1, eblq2, b_seed, tot, k, n, positive_inputs, tile](sycl::nd_item<2> item)
               MOM_SYCL_KERNEL_ARGS_RESTRICT {
             const int lr = static_cast<int>(item.get_local_id(0));
             const int lj = static_cast<int>(item.get_local_id(1));
@@ -464,8 +540,8 @@ template <bool Dpasw = false>
                 const size_t first = static_cast<size_t>(eblq1[r]) * static_cast<size_t>(n) + j;
                 const size_t second = static_cast<size_t>(eblq2[r]) * static_cast<size_t>(n) + j;
                 const int acc = static_cast<int>(ebr[first]) - static_cast<int>(ebr[second]);
-                tile[lr + d][lj] =
-                    static_cast<int8_t>(gv(seed, tot + static_cast<uint32_t>(r * n + j)) + acc);
+                tile[lr + d][lj] = static_cast<int8_t>(
+                    gv(b_seed, tot + static_cast<uint32_t>(r * n + j), positive_inputs) + acc);
               }
             }
             sycl::group_barrier(item.get_group());
@@ -474,19 +550,22 @@ template <bool Dpasw = false>
               const size_t j = j0 + static_cast<size_t>(lr + d);
               const size_t r = r0 + static_cast<size_t>(lj);
               if (j < static_cast<size_t>(n) && r < static_cast<size_t>(k))
-                bp[j * static_cast<size_t>(k) + r] = tile[lj][lr + d];
+                bp[PackedCuda ? nvidia_vector128_offset<false>(j, r, k)
+                              : j * static_cast<size_t>(k) + r] = tile[lj][lr + d];
             }
           });
     });
   }
-  return q.parallel_for(sycl::range<1>(b_elements), [ebr, bp, eblq1, eblq2, seed, tot, k, n,
-                                                      portable](sycl::id<1> id)
+  return q.parallel_for(sycl::range<1>(b_elements),
+                        [ebr, bp, eblq1, eblq2, b_seed, tot, k, n, portable, positive_inputs]
+                        (sycl::id<1> id)
       MOM_SYCL_KERNEL_ARGS_RESTRICT {
     const size_t idx = id[0], r = idx / static_cast<size_t>(n), j = idx % static_cast<size_t>(n);
     const size_t first = static_cast<size_t>(eblq1[r]) * static_cast<size_t>(n) + j;
     const size_t second = static_cast<size_t>(eblq2[r]) * static_cast<size_t>(n) + j;
     const int acc = static_cast<int>(ebr[first]) - static_cast<int>(ebr[second]);
-    const int8_t v = static_cast<int8_t>(gv(seed, tot + static_cast<uint32_t>(idx)) + acc);
+    const int8_t v = static_cast<int8_t>(
+        gv(b_seed, tot + static_cast<uint32_t>(idx), positive_inputs) + acc);
 #if defined(__NVPTX__) && (!defined(MOM_SYCL_ADAPTIVECPP) || defined(__CUDA_ARCH__))
     (void)portable;
 #endif
@@ -505,49 +584,55 @@ template <bool Dpasw = false>
 }
 
 #if defined(MOM_SYCL_HAS_HIP)
-struct PearlHashPrepEvents {
-  sycl::event a, b;
-};
-
-// Prepare A/B WMMA layouts on separate owning queues; the caller joins both returned events.
-static PearlHashPrepEvents compute_ab_amd_wmma(sycl::queue& a_queue, sycl::queue& b_queue,
+// Paired K16 fragments give each wave64 lane two scalar WMMA operands in one 64-bit load.
+// Row/depth are canonical matrix coordinates; both producers must use this same byte layout.
+static inline size_t amd_wmma_offset(size_t row, size_t depth, int k) {
+  const size_t fragment = (row / 16 * static_cast<size_t>(k / 32) + depth / 32) * 512U;
+  const size_t lane = (row & 15) + (depth & 12) * 4U;
+  return fragment + lane * 8U + (depth & 3) + ((depth & 16) >> 2);
+}
+// Select the packed layout only after native admission, reusing the ordinary A/B allocations.
+// The caller joins both producer queues before search; portable fallback regenerates its layout.
+static PearlHashEventPair compute_ab_amd_wmma(sycl::queue& a_queue, sycl::queue& b_queue,
                                                const Buffers& b, uint32_t seed, int m, int n, int k,
-                                               int rank) {
+                                               int rank, const sycl::event& a_noise_ready,
+                                               const sycl::event& b_noise_ready) {
   const uint32_t tot = static_cast<uint32_t>(checked_elements(m, k, "M*K"));
-  sycl::event a_event = a_queue.parallel_for(
-      sycl::range<1>(static_cast<size_t>(m) * k / 8U),
-      [eal = b.EAL, ap = b.ApWmma, earp1 = b.EARp1, earp2 = b.EARp2, seed, k,
-       rank](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
-        const size_t packed_chunk = id[0];
-        const int lane = static_cast<int>(packed_chunk & 31U);
-        const size_t fragment = packed_chunk >> 5;
-        const size_t row_block = fragment / static_cast<size_t>(k / 16);
-        const int k_block = static_cast<int>(fragment - row_block * static_cast<size_t>(k / 16));
-        const size_t row = row_block * 16U + static_cast<size_t>(lane & 15);
-        const int col = k_block * 16 + (lane >> 4) * 8;
-        uint64_t packed = 0;
+  const bool positive_inputs = b.positive_inputs;
+  sycl::event a_event = a_queue.submit([&](sycl::handler& h) {
+    h.depends_on(a_noise_ready);
+    h.parallel_for(
+      sycl::range<1>(static_cast<size_t>(m) * k / 4U),
+      [eal = b.EAL, ap = b.Ap, earp1 = b.EARp1, earp2 = b.EARp2, seed, k,
+       rank, positive_inputs](sycl::id<1> id) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+        const size_t word = id[0];
+        const size_t row = word / static_cast<size_t>(k / 4);
+        const int col = static_cast<int>(word % static_cast<size_t>(k / 4)) * 4;
+        uint32_t packed = 0;
 #pragma unroll
-        for (int byte = 0; byte < 8; ++byte) {
+        for (int byte = 0; byte < 4; ++byte) {
           const int c = col + byte;
           const int acc = static_cast<int>(eal[row * rank + earp1[c]]) -
                           static_cast<int>(eal[row * rank + earp2[c]]);
-          const int8_t value =
-              static_cast<int8_t>(gv(seed, static_cast<uint32_t>(row * k + c)) + acc);
-          packed |= static_cast<uint64_t>(static_cast<uint8_t>(value)) << (byte * 8);
+          const int8_t value = static_cast<int8_t>(
+              gv(seed, static_cast<uint32_t>(row * k + c), positive_inputs) + acc);
+          packed |= static_cast<uint32_t>(static_cast<uint8_t>(value)) << (byte * 8);
         }
-        reinterpret_cast<uint64_t*>(ap)[packed_chunk] = packed;
+        reinterpret_cast<uint32_t*>(ap)[amd_wmma_offset(row, col, k) / 4U] = packed;
       });
+  });
   // Generate B in row-major 32x32 tiles (coalesced EBR reads), transpose in local memory, and
   // write the exact packed fragment bytes consumed by gfx12 WMMA. This avoids materializing and
   // rereading the 64 MiB portable B matrix on every nonce.
   sycl::event b_event = b_queue.submit([&](sycl::handler& h) {
+    h.depends_on(b_noise_ready);
     sycl::local_accessor<int8_t, 2> tile(sycl::range<2>(32, 33), h);
     const size_t groups_r = (static_cast<size_t>(k) + 31) / 32;
     const size_t groups_j = (static_cast<size_t>(n) + 31) / 32;
     h.parallel_for(
         sycl::nd_range<2>(sycl::range<2>(groups_r * 8, groups_j * 32), sycl::range<2>(8, 32)),
-        [ebr = b.EBR, bp = b.BpWmma, eblq1 = b.EBLq1, eblq2 = b.EBLq2, seed, tot, k, n,
-         tile](sycl::nd_item<2> item) MOM_SYCL_KERNEL_ARGS_RESTRICT {
+        [ebr = b.EBR, bp = b.Bp, eblq1 = b.EBLq1, eblq2 = b.EBLq2, seed, tot, k, n,
+         positive_inputs, tile](sycl::nd_item<2> item) MOM_SYCL_KERNEL_ARGS_RESTRICT {
           const int lr = static_cast<int>(item.get_local_id(0));
           const int lj = static_cast<int>(item.get_local_id(1));
           const size_t r0 = item.get_group(0) * 32;
@@ -560,8 +645,8 @@ static PearlHashPrepEvents compute_ab_amd_wmma(sycl::queue& a_queue, sycl::queue
               const size_t first = static_cast<size_t>(eblq1[r]) * static_cast<size_t>(n) + j;
               const size_t second = static_cast<size_t>(eblq2[r]) * static_cast<size_t>(n) + j;
               const int acc = static_cast<int>(ebr[first]) - static_cast<int>(ebr[second]);
-              tile[lr + d][lj] =
-                  static_cast<int8_t>(gv(seed, tot + static_cast<uint32_t>(r * n + j)) + acc);
+              tile[lr + d][lj] = static_cast<int8_t>(
+                  gv(seed, tot + static_cast<uint32_t>(r * n + j), positive_inputs) + acc);
             }
           }
           item.barrier(sycl::access::fence_space::local_space);
@@ -570,9 +655,7 @@ static PearlHashPrepEvents compute_ab_amd_wmma(sycl::queue& a_queue, sycl::queue
             const size_t j = j0 + static_cast<size_t>(lr + d);
             const size_t r = r0 + static_cast<size_t>(lj);
             if (j < static_cast<size_t>(n) && r < static_cast<size_t>(k)) {
-              const size_t fragment = (j / 16 * static_cast<size_t>(k / 16) + r / 16) * 256U;
-              const size_t lane = (j & 15) + ((r & 8) ? 16 : 0);
-              bp[fragment + lane * 8U + (r & 7)] = tile[lj][lr + d];
+              bp[amd_wmma_offset(j, r, k)] = tile[lj][lr + d];
             }
           }
         });
@@ -591,7 +674,7 @@ static PearlHashPrepEvents compute_ab_amd_wmma(sycl::queue& a_queue, sycl::queue
   for (int idx = 0; idx < m * k; ++idx) {
     const int i = idx / k, c = idx % k;
     const int acc = (int)B.EAL[i * rank + B.EARp1[c]] - (int)B.EAL[i * rank + B.EARp2[c]];
-    B.Ap[idx] = (int8_t)(gv(seed, (uint32_t)idx) + acc);
+    B.Ap[idx] = (int8_t)(gv(seed, (uint32_t)idx, B.positive_inputs) + acc);
   }
   const size_t b_elements = checked_elements(n, k, "N*K");
   for (size_t idx = 0; idx < b_elements; ++idx) {
@@ -599,8 +682,8 @@ static PearlHashPrepEvents compute_ab_amd_wmma(sycl::queue& a_queue, sycl::queue
     const size_t first = static_cast<size_t>(B.EBLq1[r]) * static_cast<size_t>(n) + j;
     const size_t second = static_cast<size_t>(B.EBLq2[r]) * static_cast<size_t>(n) + j;
     const int acc = static_cast<int>(B.EBR[first]) - static_cast<int>(B.EBR[second]);
-    B.Bp[j * static_cast<size_t>(k) + r] =
-        static_cast<int8_t>(gv(seed, tot + static_cast<uint32_t>(idx)) + acc);
+    B.Bp[j * static_cast<size_t>(k) + r] = static_cast<int8_t>(
+        gv(seed, tot + static_cast<uint32_t>(idx), B.positive_inputs) + acc);
   }
 }
 

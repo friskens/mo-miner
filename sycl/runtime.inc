@@ -29,6 +29,10 @@ void mom_sycl_poll_pause() {
 }
 #endif
 
+namespace mom_pearlhash {
+bool compact_available(const sycl::device&) noexcept;
+}
+
 namespace mom_autolykos2 {
 void autolykos2_cleanup_states() noexcept;
 }

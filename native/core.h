@@ -47,7 +47,8 @@ typedef int (*gpu_pearlhash_hash_fun)(
   const uint8_t* input, unsigned input_size, uint8_t* output,
   uint64_t* pseed, const uint8_t* target,
   unsigned intensity, bool is_test, bool is_benchmark, const std::string& dev_str,
-  const std::string& backend, unsigned n, unsigned k, unsigned rank, unsigned cert_version
+  const std::string& backend, unsigned n, unsigned k, unsigned rank, unsigned cert_version,
+  const uint8_t* base_target
 );
 // FishHash variants share the etchash call shape; each implementation owns its
 // target byte order and header layout. seed_hash is unused.
@@ -138,7 +139,8 @@ class Core: public AsyncWorker {
   void* m_spads;
   struct cryptonight_ctx** m_ctx;
   uint8_t *m_input, *m_output;
-  uint8_t m_target_bin[HASH_LEN]{}, m_seed[HASH_LEN]{};
+  uint8_t m_target_bin[HASH_LEN]{}, m_seed[HASH_LEN]{},
+          m_pearlhash_base_target_bin[HASH_LEN]{};
   std::atomic<unsigned> m_job_ref;
   unsigned m_height, m_batch, m_mem_size, m_input_len, m_nonce_step,
            m_nonce_bytes, m_nonce_offset, m_thread_id, m_thread_num,
@@ -151,7 +153,7 @@ class Core: public AsyncWorker {
   std::atomic<uint64_t> m_hash_count;
   std::string m_algo_str, m_dev_str, m_seed_hex, m_input_hex, m_pool_id, m_worker_id, m_job_id,
               m_job_token, m_header_hash, m_backend;
-  bool m_has_fn, m_is_rx_jit, m_nonce_exhausted;
+  bool m_has_fn, m_is_rx_jit, m_nonce_exhausted, m_pearlhash_has_base_target;
   JobMode m_job_mode;
   randomx_cache*   m_rx_cache;
   randomx_dataset* m_rx_dataset;
@@ -260,6 +262,7 @@ class Core: public AsyncWorker {
       m_nonce_prefix(0),
       m_target(0), m_timestamp(0),
       m_hash_count(0), m_has_fn(false), m_is_rx_jit(true), m_nonce_exhausted(false),
+      m_pearlhash_has_base_target(false),
       m_job_mode(JobMode::mine),
       m_rx_cache(nullptr), m_rx_dataset(nullptr)
   {}

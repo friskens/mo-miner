@@ -6,10 +6,19 @@ enum class PearlHashSearchBackend {
 
 // Prepare this seed's commitments/matrices, select a compatible search, and report the backend used.
 static PearlHashSearchBackend
-attempt(sycl::queue& q, const Buffers& b, uint32_t seed, int m, int n, int k, int rank,
+attempt(sycl::queue& q, Buffers& b, uint32_t seed, int m, int n, int k, int rank,
         const std::string& backend = "auto", PearlHashHipSearch* hip = nullptr,
         PearlHashCudaSearch* cuda = nullptr, sycl::queue* hip_prep_queue = nullptr,
-        bool validate_native = false, bool cuda_tensor = false, bool cuda_f16 = false) {
+        bool validate_native = false, bool cuda_tensor = false, bool cuda_f16 = false,
+        bool pair_dist8 = false, bool fixed_b_reuse = false,
+        const sycl::event* roots_override = nullptr) {
+  // Only the already-admitted native CUDA pair route may skip B preparation.  Every other
+  // backend keeps the original single-seed producer contract, including all AMD/Intel paths.
+  b.fixed_b_reuse = pair_dist8 && fixed_b_reuse;
+  // A second producer queue belongs only to HIP; CUDA/portable preparation stays on q.
+  if (!hip || (hip_prep_queue && !mom_is_hip(q.get_device())))
+    hip_prep_queue = nullptr;
+  const bool split_hip_noise = hip_prep_queue != nullptr;
   static thread_local unsigned stats_attempts = 0;
   const bool stats = std::getenv("MOM_PEARLHASH_STATS") && stats_attempts++ < 3;
   auto stats_last = std::chrono::steady_clock::now();
@@ -17,26 +26,38 @@ attempt(sycl::queue& q, const Buffers& b, uint32_t seed, int m, int n, int k, in
     if (!stats)
       return;
     q.wait_and_throw();
+    if (hip_prep_queue)
+      hip_prep_queue->wait_and_throw();
     const auto now = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(now - stats_last).count();
     std::fprintf(stderr, "PEARLHASH_SYCL_STATS %s=%.3fms\n", stage, ms);
     stats_last = now;
   };
+  sycl::event roots_ready;
 #if defined(_WIN32)
   const bool windows_cpu = q.get_device().is_cpu();
   if (windows_cpu) {
     q.wait_and_throw();
     prepare_roots_cpu(b, seed, m, n, k);
-  } else
+  } else {
 #endif
-    k_roots(q, b, seed, m, n, k); // commitment roots cA/cB (A/Bt regenerated from RNG)
+    roots_ready = roots_override ? *roots_override : k_roots(q, b, seed, m, n, k);
+#if defined(_WIN32)
+  }
+#endif
   mark("roots");
+  PearlHashEventPair noise_ready;
 #if defined(_WIN32)
   if (windows_cpu)
     prepare_noise_cpu(b, m, n, k, rank);
-  else
+  else {
 #endif
-    k_noise(q, b, m, n, k, rank); // sparse low-rank noise E_AL/E_AR, E_BL/E_BR
+    sycl::queue& noise_b_queue = hip_prep_queue ? *hip_prep_queue : q;
+    noise_ready = k_noise(q, noise_b_queue, b, m, n, k, rank,
+                          roots_ready); // sparse low-rank A/B noise
+#if defined(_WIN32)
+  }
+#endif
   mark("noise");
 
   // Pick the search kernel by the running device's backend BEFORE laying out A'/B': compute_ab needs to
@@ -101,38 +122,52 @@ attempt(sycl::queue& q, const Buffers& b, uint32_t seed, int m, int n, int k, in
   // Only JIT unavailability permits fallback. Preparation, launch and completion faults must
   // escape: retrying another kernel on the same potentially invalid queue is not recovery.
 #if defined(MOM_SYCL_HAS_HIP)
-  if ((backend == "auto" || backend == "native") && hip && hip->ensure(q, m, n, k, rank)) {
-    q.wait_and_throw(); // both independent prep streams consume the completed noise tables
+  if ((backend == "auto" || backend == "native") && hip && hip->ensure(q, b, m, n, k, rank)) {
     sycl::queue& prep = hip_prep_queue ? *hip_prep_queue : q;
-    PearlHashPrepEvents ready = compute_ab_amd_wmma(q, prep, b, seed, m, n, k, rank);
-    while (ready.a.get_info<sycl::info::event::command_execution_status>() !=
-               sycl::info::event_command_status::complete ||
-           ready.b.get_info<sycl::info::event::command_execution_status>() !=
-               sycl::info::event_command_status::complete)
-#if defined(_WIN32)
-      mom_sycl_poll_pause();
-#else
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-#endif
-    ready.a.wait_and_throw();
-    ready.b.wait_and_throw();
+    PearlHashEventPair ready = compute_ab_amd_wmma(q, prep, b, seed, m, n, k, rank,
+                                                    noise_ready.a, noise_ready.b);
+    // Reuse the shared low-CPU wait, including its query-fault retirement and OpenCL policy.
+    sycl_wait_and_throw(ready.a, q.get_device());
+    sycl_wait_and_throw(ready.b, prep.get_device());
     mark("ab");
     hip->launch(b, seed, m, n, k, rank, dbg);
     return PearlHashSearchBackend::hip_jit;
   }
 #endif
 #if defined(MOM_SYCL_HAS_CUDA)
-  if ((backend == "auto" || backend == "native") && is_cuda && cuda &&
-      cuda->ensure(q, b, m, n, k, rank)) {
-    // CUTE consumes the common row-major A / column-major B representation. The preparation
-    // remains the shared SYCL kernel; only the matrix mainloop and transcript hash are native.
-    compute_ab(q, b, seed, m, n, k, rank, /*portable=*/true);
+  const bool cuda_ready = (backend == "auto" || backend == "native") && is_cuda && cuda &&
+      cuda->ensure(q, b, m, n, k, rank);
+  if (cuda_ready) {
+    // Rank-128 native CUTE consumes the producer-packed A/B representation. Rank-256
+    // deliberately retains the ordinary row/column layout used by the staged payload.
+    if (cuda->compact) {
+      // Ap/Bp are unused by the raw solver; reuse their first K words for
+      // canonical packed input and sorted output instead of another allocation.
+      q.parallel_for(sycl::range<1>(static_cast<size_t>(k)),[=](sycl::id<1> id) {
+        const size_t i=id[0];
+        reinterpret_cast<uint32_t*>(b.Ap)[i]=static_cast<uint32_t>(b.EARp1[i]) |
+            (static_cast<uint32_t>(b.EARp2[i])<<8) |
+            (static_cast<uint32_t>(b.EBLq1[i])<<16) |
+            (static_cast<uint32_t>(b.EBLq2[i])<<24);
+      });
+    } else if (rank == 128)
+      compute_ab<false, true>(q, b, seed, m, n, k, rank, /*portable=*/true);
+    else
+      compute_ab(q, b, seed, m, n, k, rank, /*portable=*/true);
     q.wait_and_throw();
     mark("ab");
     cuda->launch(b, seed, m, n, k, dbg);
     return PearlHashSearchBackend::cuda_jit;
   }
+  if (pair_dist8)
+    throw std::string("PearlHash pair-dist8 CUDA route became unavailable after admission");
 #endif
+  // If the optional native route declined after split submission, rejoin the prep queue before
+  // the shared path reads the noise tables. Successful native dispatches already returned above.
+  if (split_hip_noise) {
+    sycl_wait_and_throw(noise_ready.a, q.get_device());
+    sycl_wait_and_throw(noise_ready.b, hip_prep_queue->get_device());
+  }
 #if defined(PEARLHASH_ESIMD)
   // Paired DG2 proofs/rates are qualified on oneAPI Level Zero; combined AOT/OpenCL stay ordinary.
   const bool use_dpasw = pearlhash_dpasw_route(

@@ -24,24 +24,37 @@ static inline void pearlhash_bind_root(const uint8_t raw_root[32], const uint32_
 }
 
 // V3 binds each raw root to its matrix dimension with a domain-separated key, then computes
-// cB = BLAKE3(key || bound_rootB) and cA = BLAKE3(cB || bound_rootA). The raw roots remain
-// available to the host PlainProof builder and are never replaced in the proof.
-static inline void pearlhash_commitment_seeds(
-    const uint8_t key[32], const uint8_t raw_root_a[32], const uint8_t raw_root_b[32],
-    const uint32_t m, const uint32_t n, uint8_t c_b[32], uint8_t c_a[32]) {
-  uint8_t root_a[32], root_b[32], input[64];
-  pearlhash_bind_root(raw_root_a, m, PEARLHASH_SEED_SALT_A, root_a);
+// cB = BLAKE3(key || bound_rootB) and cA = BLAKE3(cB || bound_rootA). Keep the two steps
+// separately callable so a native pair attempt can retain B's complete commitment/noise path
+// while regenerating A and cA for each new attempt seed. The raw roots remain available to the
+// host PlainProof builder and are never replaced in the proof.
+static inline void pearlhash_commitment_seed_b(
+    const uint8_t key[32], const uint8_t raw_root_b[32], const uint32_t n, uint8_t c_b[32]) {
+  uint8_t root_b[32], input[64];
   pearlhash_bind_root(raw_root_b, n, PEARLHASH_SEED_SALT_B, root_b);
   for (int i = 0; i < 32; ++i) {
     input[i] = key[i];
     input[32 + i] = root_b[i];
   }
   pearlhash_b3::b3(input, 64, nullptr, c_b);
+}
+
+static inline void pearlhash_commitment_seed_a(
+    const uint8_t c_b[32], const uint8_t raw_root_a[32], const uint32_t m, uint8_t c_a[32]) {
+  uint8_t root_a[32], input[64];
+  pearlhash_bind_root(raw_root_a, m, PEARLHASH_SEED_SALT_A, root_a);
   for (int i = 0; i < 32; ++i) {
     input[i] = c_b[i];
     input[32 + i] = root_a[i];
   }
   pearlhash_b3::b3(input, 64, nullptr, c_a);
+}
+
+static inline void pearlhash_commitment_seeds(
+    const uint8_t key[32], const uint8_t raw_root_a[32], const uint8_t raw_root_b[32],
+    const uint32_t m, const uint32_t n, uint8_t c_b[32], uint8_t c_a[32]) {
+  pearlhash_commitment_seed_b(key, raw_root_b, n, c_b);
+  pearlhash_commitment_seed_a(c_b, raw_root_a, m, c_a);
 }
 
 } // namespace mom_pearlhash

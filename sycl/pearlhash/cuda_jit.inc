@@ -21,6 +21,7 @@ pearlhash_cuda_header_root(const char* configured,
 #include "cuda_search.inc"
 #else
 struct PearlHashCudaSearch {
+  bool compact = false;
   static bool is_cuda(const sycl::device&) {
     return false;
   }

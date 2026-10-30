@@ -398,6 +398,8 @@ void Core::set_job(
     // Bench/test nonces must never be reported as resumable work for the previous pool job.
     m_target = 0;
     std::memset(m_target_bin, 0, HASH_LEN);
+    m_pearlhash_has_base_target = false;
+    std::memset(m_pearlhash_base_target_bin, 0, HASH_LEN);
     m_pool_id.clear();
     m_worker_id.clear();
     m_job_id.clear();

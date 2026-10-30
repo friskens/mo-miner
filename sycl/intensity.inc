@@ -1,3 +1,10 @@
+#if defined(MOM_SYCL_ADAPTIVECPP) && defined(MOM_SYCL_HAS_HIP)
+#ifndef __HIP_PLATFORM_AMD__
+#define __HIP_PLATFORM_AMD__
+#endif
+#include "hiprtc-api.h"
+#endif
+
 #include "pow-intensity.h"
 
 // Accept only supported, device-admissible workgroup sizes; malformed overrides use the heuristic.
@@ -129,6 +136,24 @@ static unsigned autolykos2_intensity(const sycl::device& dev) {
                        {{64, 4096, 12}, {64, 8192, 16}, {64, 8192, 10}});
 }
 
+// Discovery probes the same native architecture boundary as the worker. This optional probe is
+// deliberately fail-closed: a queue/interop/property failure leaves the ordinary profile usable.
+static bool pearlhash_amd_native_int8(const sycl::device& dev) {
+#if defined(MOM_SYCL_ADAPTIVECPP) && defined(MOM_SYCL_HAS_HIP)
+  try {
+    if (!mom_is_hip(dev))
+      return false;
+    sycl::queue queue(dev);
+    return mom::hip_gfx12_int8_wmma_supported(queue);
+  } catch (...) {
+    return false;
+  }
+#else
+  (void)dev;
+  return false;
+#endif
+}
+
 // Rank changes proof work, so automatic tuning selects complete measured profiles rather than
 // varying M alone. Intel's wider native DPAS path has a separate measured K; NVIDIA profiles must
 // also fit required allocations and runtime headroom.
@@ -164,6 +189,13 @@ static pearlhash_profile_t pearlhash_profile(const sycl::device& dev) {
       // Keep the conservative K2048/rank128 profile on incomplete device metadata.
     }
   }
+  if (pearlhash_amd_native_int8(dev)) {
+    try {
+      profile = pearlhash_amd_native_profile_for(pow_device_profile(dev), true);
+    } catch (...) {
+      // Optional capacity metadata must not make discovery reject the portable profile.
+    }
+  }
   unsigned long parsed = 0;
   if (mom_parse_env_ulong("MOM_PEARLHASH_INTENSITY", parsed) && parsed >= 256 &&
       parsed <= std::numeric_limits<unsigned>::max()) {
@@ -171,7 +203,22 @@ static pearlhash_profile_t pearlhash_profile(const sycl::device& dev) {
     profile.n = profile.m;
     return profile;
   }
-  return nvidia ? pearlhash_capacity_profile(pow_device_profile(dev), profile) : profile;
+  if (nvidia) {
+    try {
+      auto capacity = pow_device_profile(dev);
+      // The generic heuristic substitutes one CU for unknown reports; complete
+      // SM-wave admission needs the actual nonzero count instead.
+      capacity.compute_units = dev.get_info<sycl::info::device::max_compute_units>();
+      const auto candidate = pearlhash_nvidia_compact_profile_for(
+          capacity, mom_pearlhash::compact_available(dev));
+      if (candidate.m)
+        return candidate;
+    } catch (...) {
+      // Preserve ordinary discovery on missing optional runtime/device metadata.
+    }
+    return pearlhash_capacity_profile(pow_device_profile(dev), profile);
+  }
+  return profile;
 }
 
 // FishHash: memory-gather over the 4.6 GiB DAG (bandwidth-bound like etchash). etchash-class intensities.

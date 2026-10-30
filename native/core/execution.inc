@@ -238,7 +238,8 @@ void Core::Execute() try {
               dispatch_job_ref, m_height, m_input, m_input_len, m_output,
               &dev_nonce, m_target_bin,
               m_batch, is_test, is_benchmark, m_dev_str, m_backend,
-              m_pearlhash_n, m_pearlhash_k, m_pearlhash_rank, m_pearlhash_cert_version
+              m_pearlhash_n, m_pearlhash_k, m_pearlhash_rank, m_pearlhash_cert_version,
+              m_pearlhash_has_base_target ? m_pearlhash_base_target_bin : nullptr
             );
             break;
           case DEV::FISHHASH_GPU:
