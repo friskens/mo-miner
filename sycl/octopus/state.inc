@@ -130,6 +130,7 @@ public:
       wpow = mod_field(static_cast<uint64_t>(wpow) * w);
       w2pow = mod_field(static_cast<uint64_t>(w2pow) * w2);
     }
+    MomSyclHostTransferGuard host_points_transfers(queue, "octopus points upload");
     // A failed copy must not leave the previous header marked ready.
     points_ready = false;
     if (shared_io)
@@ -174,6 +175,7 @@ public:
     cache = allocate<uint32_t>(host_cache.size());
     if (!cache)
       throw std::string("Can't allocate octopus light cache");
+    MomSyclHostTransferGuard host_cache_transfers(queue, "octopus cache upload");
     if (shared_io)
       std::memcpy(cache, host_cache.data(), bytes);
     else

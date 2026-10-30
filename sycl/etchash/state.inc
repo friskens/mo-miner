@@ -307,6 +307,7 @@ public:
     if (!light_cache || !dag)
       throw std::string("Can't allocate etchash DAG buffers");
 
+    MomSyclHostTransferGuard host_cache_transfers(queue, "etchash cache upload");
     if (shared_dag)
       std::memcpy(light_cache, host_cache.data(), host_cache.size() * sizeof(uint32_t));
     else

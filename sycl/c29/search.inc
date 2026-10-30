@@ -53,7 +53,7 @@ struct C29SearchCompletionGuard {
   std::shared_ptr<C29ResultState> result_state;
   unsigned job_ref;
 
-  // Count a detached search before launch; transferred ownership decrements it on every exit.
+  // Count an async search before launch; transferred ownership decrements it on every exit.
   C29SearchCompletionGuard(std::shared_ptr<C29ResultState> state, const unsigned ref)
       : result_state(std::move(state)), job_ref(ref) {
     std::lock_guard<std::mutex> lock(result_state->mutex);
@@ -82,23 +82,37 @@ struct C29SearchCompletionGuard {
   }
 };
 
-// Worker function that performs GPU trimming and cycle finding in separate thread
+// Worker function that performs GPU trimming and cycle finding in an owned async task.
 static void start_new_c29_solution_search(const uint64_t seed_k0, const uint64_t seed_k1,
                                           const uint64_t seed_k2, const uint64_t seed_k3,
                                           const unsigned job_ref, const uint64_t nonce,
                                           const unsigned c29_proof_size, sycl::queue& compute_queue,
                                           C29Buffers& c29_buffers,
-                                          std::shared_ptr<C29ResultState> result_state) {
+                                          std::shared_ptr<C29ResultState> result_state,
+                                          std::vector<std::future<void>>& search_futures) {
   try {
     const sycl::device device = compute_queue.get_device();
     C29Profile profile(job_ref, nonce, c29_proof_size, device);
 
 #include "seed.inc"
 #include "trim.inc"
-    // Cycle search runs on a detached thread so the GPU queue is freed for the next graph.
+    // Move the retired graph to its owned async cycle search, freeing the GPU for the next graph
+    // without copying the potentially multi-megabyte host handoff.
     try {
+      // c29() holds C29State::mutex here; active futures remain owned until a later ready reap.
+      for (auto it = search_futures.begin(); it != search_futures.end();) {
+        if (it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+          it = search_futures.erase(it);
+        else
+          ++it;
+      }
       C29SearchCompletionGuard completion_guard(result_state, job_ref);
-      std::thread([=, completion_guard = std::move(completion_guard)]() mutable {
+      auto search = std::async(std::launch::async,
+          [=, trimmed_edges = std::move(trimmed_edges),
+           completion_guard = std::move(completion_guard)]() mutable {
+        // Move out of the future's callable before entering the body: implementations may retain
+        // the callable after invocation, but the running-search count must end with this body.
+        C29SearchCompletionGuard active_completion_guard = std::move(completion_guard);
         try {
           const auto solutions = mom_c29::find_cycles(trimmed_edges, c29_proof_size);
 
@@ -123,7 +137,8 @@ static void start_new_c29_solution_search(const uint64_t seed_k0, const uint64_t
         } catch (...) {
           printf("Error in solution search worker: unknown exception\n");
         }
-      }).detach();
+      });
+      search_futures.push_back(std::move(search));
     } catch (const std::exception& e) {
       printf("Error starting solution search worker: %s\n", e.what());
     } catch (...) {

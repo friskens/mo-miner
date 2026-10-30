@@ -111,10 +111,15 @@ int walahash(unsigned, uint32_t, const uint8_t* input, unsigned input_size, uint
   if (!state.matrix_ready || std::memcmp(state.matrix_seed, input, 32)) {
     state.matrix_ready = false;
     uint8_t matrix[4096];
+    // Keep this branch-local source alive if a runtime accepts the copy and then throws before
+    // returning its event; the outer guard is destroyed after this array during unwinding.
+    MomSyclHostTransferGuard matrix_transfers(state.queue, "walahash matrix upload");
     make_matrix(input, matrix);
 #ifdef WALAHASH_ESIMD
     if (intel_fast) {
       uint8_t tiled[4096];
+      // The tiled source has the same accepted-copy/throw boundary on the ESIMD path.
+      MomSyclHostTransferGuard tiled_transfers(state.queue, "walahash tiled matrix upload");
       for (unsigned r = 0; r < 64; ++r)
         for (unsigned k = 0; k < 64; ++k)
           tiled[((r >> 3) * 2 + (k >> 5)) * 256 + (r & 7) * 32 + (k & 31)] = matrix[r * 64 + k];

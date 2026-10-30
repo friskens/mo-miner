@@ -388,9 +388,9 @@ int beamhash3(const unsigned, const uint32_t, const uint8_t* const input, const 
           uint32_t maxns = 0;
           {
             std::vector<uint32_t> ns(NBUCKETS);
-            q.memcpy(ns.data(), state.bucket_ns[cuda_layout ? 0 : CUR],
-                     (size_t)NBUCKETS * sizeof(uint32_t))
-                .wait();
+            MomSyclHostTransferGuard bucket_count_transfer(q, "beamhash3 bucket count readback");
+            sycl_wait_and_throw(q.memcpy(ns.data(), state.bucket_ns[cuda_layout ? 0 : CUR],
+                                         (size_t)NBUCKETS * sizeof(uint32_t)), state.device);
             for (uint32_t v : ns)
               if (v > maxns)
                 maxns = v;

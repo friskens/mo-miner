@@ -1,5 +1,4 @@
 
-
 // Cuckaroo Cycle algorithm constants and fixed kernel sizing.
 const constexpr uint64_t DUCK_SIZE_A = 129, DUCK_SIZE_B = 83, INDEX_SIZE = 4096,
                          MAX_INITIAL_INDEX_SIZE = 65536;
@@ -233,6 +232,9 @@ struct C29State {
   sycl::queue queue;
   C29Buffers buffers;
   std::shared_ptr<C29ResultState> result_state;
+  std::vector<std::future<void>> search_futures;
+  // Serialize graph submission and buffer readback; an in-order queue does not serialize host callers.
+  std::mutex mutex;
 
   // Bind buffers and results to one ordered device queue, enabling timestamps only on diagnostic runs.
   explicit C29State(const std::string& dev_str)
@@ -246,11 +248,13 @@ struct C29State {
     result_state = std::make_shared<C29ResultState>();
   }
 
-  // Drain graph submissions before buffer destruction; detached host searches own their result state.
+  // Drain graph submissions before buffer destruction and join owned host searches before the
+  // SYCL runtime can unload underneath their result-state owner.
   ~C29State() {
     sycl_cleanup_noexcept("c29", [&] {
       queue.wait_and_throw();
     });
+    search_futures.clear();
   }
 };
 
@@ -280,12 +284,15 @@ static void c29_read_buffer(sycl::queue& queue, sycl::buffer<T, 1>& buffer, T* c
   if (count == 0)
     return;
 
+  // A failed device query must not strand an accepted copy into caller-owned memory.
+  const sycl::device device = queue.get_device();
+  MomSyclHostTransferGuard host_transfers(queue, "c29 buffer readback");
   const sycl::event event = queue.submit([&](sycl::handler& handler) {
     sycl::accessor accessor{buffer, handler, sycl::range<1>{count}, sycl::id<1>{0},
                             sycl::read_only};
     handler.copy(accessor, dest);
   });
-  sycl_wait_and_throw(event, queue.get_device());
+  sycl_wait_and_throw(event, device);
 }
 
 // Publish the active job and discard stale queued proofs while holding the result mutex.
@@ -296,7 +303,7 @@ static void c29_activate_job(const std::shared_ptr<C29ResultState>& result_state
     return;
 
   result_state->active_job_ref = job_ref;
-  // Keep detached searches isolated to the device's current job.
+  // Keep owned host searches isolated to the device's current job.
   for (auto it = result_state->solutions.begin(); it != result_state->solutions.end();) {
     if (it->job_ref != job_ref)
       it = result_state->solutions.erase(it);

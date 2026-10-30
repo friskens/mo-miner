@@ -379,7 +379,10 @@ struct Solver {
     }
     sycl_wait_and_throw(compact_event, device);
     std::uint32_t compacted = 0;
-    sycl_wait_and_throw(queue.memcpy(&compacted, memory.cursors, sizeof(compacted)), device);
+    {
+      MomSyclHostTransferGuard host_transfers(queue, "c30 compact count readback");
+      sycl_wait_and_throw(queue.memcpy(&compacted, memory.cursors, sizeof(compacted)), device);
+    }
     if (compacted != survivor_count)
       throw std::runtime_error("c30 compact count mismatch");
     input_index = memory.low_memory ? 0 : output_index;
@@ -392,11 +395,13 @@ struct Solver {
     if (survivor_count > kMaxHostEdges)
       throw std::runtime_error("c30 trimmed graph is too large for the host cycle search");
     std::vector<sycl::uint2> trimmed_edges(survivor_count);
-    sycl_wait_and_throw(
-        queue.memcpy(trimmed_edges.data(), memory.edges[input_index],
-                     static_cast<std::size_t>(survivor_count) * sizeof(sycl::uint2)),
-        device);
-
+    {
+      MomSyclHostTransferGuard host_transfers(queue, "c30 graph readback");
+      sycl_wait_and_throw(
+          queue.memcpy(trimmed_edges.data(), memory.edges[input_index],
+                       static_cast<std::size_t>(survivor_count) * sizeof(sycl::uint2)),
+          device);
+    }
     std::vector<host::Endpoints> trimmed(survivor_count);
     for (std::size_t i = 0; i < trimmed.size(); ++i)
       trimmed[i] = {trimmed_edges[i].x(), trimmed_edges[i].y()};
@@ -423,8 +428,11 @@ struct Solver {
 
     Solution solution;
     solution.nonce = job.nonce;
-    sycl_wait_and_throw(
-        queue.memcpy(solution.edges.data(), memory.recovered, sizeof(solution.edges)), device);
+    {
+      MomSyclHostTransferGuard host_transfers(queue, "c30 nonce readback");
+      sycl_wait_and_throw(
+          queue.memcpy(solution.edges.data(), memory.recovered, sizeof(solution.edges)), device);
+    }
     report("nonce recovery");
     if (std::find(solution.edges.begin(), solution.edges.end(),
                   std::numeric_limits<std::uint32_t>::max()) != solution.edges.end())
@@ -461,6 +469,7 @@ C30State& c30_state(const std::string& dev_str) {
 // Check four block-boundary endpoints on device without allocating the full C30 graph.
 int c30_portable_test(const mom::c30::Job& job, std::uint8_t* output, const std::string& dev_str) {
   sycl::queue queue(get_dev(dev_str), sycl::property::queue::in_order{});
+  const sycl::device device = queue.get_device();
   const mom::c30::host::SipKey host_key = mom::c30::host::graph_key(job.header, job.nonce);
   const C30DeviceKey key{host_key.k0, host_key.k1, host_key.k2, host_key.k3};
   sycl::uint2* endpoints = sycl::malloc_shared<sycl::uint2>(4, queue);
@@ -474,7 +483,7 @@ int c30_portable_test(const mom::c30::Job& job, std::uint8_t* output, const std:
         endpoints[item] = sycl::uint2{c30_endpoint(hash, true), c30_other_endpoint(hash, true)};
       });
     });
-    sycl_wait_and_throw(event, queue.get_device());
+    sycl_wait_and_throw(event, device);
     for (unsigned i = 0; i < 4; ++i) {
       const std::uint32_t pair[2] = {endpoints[i].x(), endpoints[i].y()};
       std::memcpy(output + i * sizeof(pair), pair, sizeof(pair));

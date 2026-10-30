@@ -248,6 +248,7 @@ private:
     if (!data)
       throw compact_test_data ? std::string("Can't allocate bounded Verthash test dataset")
                               : std::string("Can't allocate verthash dataset (1.20 GiB)");
+    MomSyclHostTransferGuard host_data_transfers(queue, "verthash data upload");
     if (cpu_data)
       std::memcpy(data, host.data(), data_bytes);
     else

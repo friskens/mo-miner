@@ -100,6 +100,7 @@ public:
       cache = alloc<uint64_t>(hcache.size());
       if (!cache)
         throw std::string("Can't allocate fishhash light cache");
+      MomSyclHostTransferGuard host_cache_transfers(queue, "fishhash cache upload");
       if (shared_io)
         std::memcpy(cache, hcache.data(), hcache.size() * sizeof(uint64_t));
       else

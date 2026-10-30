@@ -32,6 +32,7 @@ namespace mom_hoohash {
 
 struct Result {
   uint32_t offset;
+  // Test-only output keeps the GPU filter observable; accepted hashes use canonical host math.
   uint8_t hash[32];
 };
 struct FloatPair {
@@ -460,10 +461,11 @@ int hoohash(unsigned, uint32_t, const uint8_t* input, unsigned input_size, uint8
   state.queue.memcpy(state.input, input, 72);
   state.queue.memcpy(state.target, target, 32);
   if (is_test) {
-    state.queue.memset(state.result, 0xff, sizeof(Result));
+    state.queue.memset(state.result, 0xff, sizeof(uint32_t));
     sycl_wait_and_throw(test_hash(state, *pnonce), state.device);
     Result result;
-    sycl_wait_and_throw(state.queue.memcpy(&result, state.result, sizeof(result)), state.device);
+    MomSyclHostTransferGuard result_transfer(state.queue, "hoohash test result readback");
+    sycl_wait_and_throw(state.queue.memcpy(&result.offset, state.result, sizeof(result.offset)), state.device);
     if (result.offset)
       return 0;
     mom_hoohash_canonical_hash(input, *pnonce, output);
@@ -473,13 +475,14 @@ int hoohash(unsigned, uint32_t, const uint8_t* input, unsigned input_size, uint8
   uint64_t first_nonce = *pnonce;
   unsigned remaining = intensity, rejected_candidates = 0;
   while (remaining) {
-    state.queue.memset(state.result, 0xff, sizeof(Result));
+    state.queue.memset(state.result, 0xff, sizeof(uint32_t));
     const sycl::event work_event = search(state, first_nonce, remaining);
     // Some runtimes busy-spin while submitting a host copy behind live kernels. Complete the GPU
     // work with the shared low-CPU wait before enqueuing the already-ready result copy.
     sycl_wait_and_throw(work_event, state.device);
     Result result;
-    sycl_wait_and_throw(state.queue.memcpy(&result, state.result, sizeof(result)), state.device);
+    MomSyclHostTransferGuard result_transfer(state.queue, "hoohash result readback");
+    sycl_wait_and_throw(state.queue.memcpy(&result.offset, state.result, sizeof(result.offset)), state.device);
     if (result.offset == UINT32_MAX)
       return 0;
 

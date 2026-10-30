@@ -53,28 +53,19 @@ public:
       cleanup();
     });
   }
-  // Release owned USM after work is drained; runtime free failures propagate to the cleanup caller.
-  void free_all() {
-    if (lut) {
-      sycl::free(lut, queue);
-      lut = nullptr;
-    }
-    if (scratch) {
-      sycl::free(scratch, queue);
-      scratch = nullptr;
-    }
-    if (result) {
-      sycl::free(result, queue);
-      result = nullptr;
-    }
-    if (target) {
-      sycl::free(target, queue);
-      target = nullptr;
-    }
-    if (input) {
-      sycl::free(input, queue);
-      input = nullptr;
-    }
+  // Detach before a potentially throwing runtime free; still attempt every other allocation.
+  template <typename T> void free_ptr(T*& pointer) noexcept {
+    T* const released = pointer;
+    pointer = nullptr;
+    if (released)
+      sycl_cleanup_noexcept("xelishashv3 USM release", [&] { sycl::free(released, queue); });
+  }
+  void free_all() noexcept {
+    free_ptr(lut);
+    free_ptr(scratch);
+    free_ptr(result);
+    free_ptr(target);
+    free_ptr(input);
     capacity = 0;
   }
   // Drain kernels before freeing their work, LUT, result, and scratch allocations.
@@ -104,8 +95,7 @@ public:
     uint64_t* old_scratch = scratch;
     scratch = replacement;
     capacity = count;
-    if (old_scratch)
-      sycl::free(old_scratch, queue);
+    free_ptr(old_scratch);
   }
 };
 // Keep device owners heap-registered so explicit shutdown controls SYCL destruction order.

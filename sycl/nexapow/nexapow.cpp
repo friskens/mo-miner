@@ -227,12 +227,13 @@ int nexapow(unsigned, uint32_t, const uint8_t* input, unsigned input_size, uint8
   Result found{};
   MomSyclHostTransferGuard host_transfers(state.queue, "nexapow monolithic host transfers");
   state.queue.memcpy(state.header, input, 32);
-  state.queue.memcpy(state.extranonce, input + 32, 8);
+  if (extra_bytes)
+    state.queue.memcpy(state.extranonce, input + 32, extra_bytes);
   if (is_test)
     state.queue.memset(state.target, 0xff, 32);
   else
     state.queue.memcpy(state.target, target, 32);
-  sycl_wait_and_throw(state.queue.memset(state.result, 0, sizeof(Result)), state.device);
+  state.queue.memset(state.result, 0, sizeof(Result));
   const uint8_t* header = state.header;
   const uint8_t* extranonce = state.extranonce;
   const uint8_t* device_target = state.target;

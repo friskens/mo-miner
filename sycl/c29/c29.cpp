@@ -21,9 +21,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <future>
 #include <memory>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -64,6 +64,7 @@ int c29(const unsigned job_ref, const unsigned c29_proof_size, const uint8_t* co
       return input_size ? c29_portable_test(input, input_size, output, dev_str) : -1;
 
     C29State& state = c29_state(dev_str);
+    std::lock_guard<std::mutex> state_lock(state.mutex);
     sycl::queue& compute_queue = state.queue;
     const std::shared_ptr<C29ResultState> result_state = state.result_state;
     c29_activate_job(result_state, job_ref);
@@ -112,7 +113,7 @@ int c29(const unsigned job_ref, const unsigned c29_proof_size, const uint8_t* co
       });
 
       // FluffyRecovery kernel - find nonces that generate solution edges
-      compute_queue.submit([&](sycl::handler& handler) {
+      const sycl::event recovery_event = compute_queue.submit([&](sycl::handler& handler) {
         sycl::accessor acc_edges{buffer_edges, handler, sycl::read_only};
         sycl::accessor acc_nonces{buffer_nonces, handler, sycl::read_write};
         sycl::local_accessor<uint32_t, 1> local_nonces{sycl::range<1>{c29_proof_size}, handler};
@@ -163,6 +164,9 @@ int c29(const unsigned job_ref, const unsigned c29_proof_size, const uint8_t* co
 
       std::vector<uint32_t> nonces(c29_proof_size, NUM_EDGES);
 
+      // Retire the expensive recovery kernel through the shared low-CPU wait rather than
+      // blocking a host accessor inside the runtime; keep its buffers alive through any fault.
+      sycl_wait_and_throw(recovery_event, state.device);
       {
         sycl::host_accessor acc{buffer_nonces, sycl::read_only};
         std::memcpy(nonces.data(), acc.get_pointer(), c29_proof_size * sizeof(uint32_t));
@@ -205,7 +209,8 @@ int c29(const unsigned job_ref, const unsigned c29_proof_size, const uint8_t* co
       };
       rx_blake2b(blake_output, 32, input, input_size);
       start_new_c29_solution_search(k[0], k[1], k[2], k[3], job_ref, *pnonce, c29_proof_size,
-                                    compute_queue, state.buffers, result_state);
+                                    compute_queue, state.buffers, result_state,
+                                    state.search_futures);
 
       return 0; // no immediate results
     } else {    // poll: -1 once every worker has drained, otherwise 0 (still searching)
@@ -226,6 +231,7 @@ int c29_portable_test(const uint8_t* const input, const unsigned input_size,
   // CPU-compatible bounded guard; full C29 vectors retain end-to-end solver coverage on discrete
   // GPUs.
   sycl::queue queue(get_dev(dev_str), sycl::property::queue::in_order{});
+  const sycl::device device = queue.get_device();
   union {
     uint8_t blake_output[32];
     uint64_t k[4];
@@ -250,7 +256,7 @@ int c29_portable_test(const uint8_t* const input, const unsigned input_size,
                                       static_cast<uint32_t>((hash_lookup >> 32) & EDGE_MASK)};
       });
     });
-    sycl_wait_and_throw(event, queue.get_device());
+    sycl_wait_and_throw(event, device);
     for (unsigned i = 0; i < 4; ++i) {
       const uint32_t pair[2] = {endpoints[i].x(), endpoints[i].y()};
       std::memcpy(output + i * sizeof(pair), pair, sizeof(pair));
